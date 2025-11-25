@@ -170,8 +170,23 @@ async def update_dashboard():
             pnl_text = f"{int(unrealized):,}원 ({pnl_rate_curr:+.2f}%)"
             entry_text = f"{int(pos['entry_price']):,}원"
             
-            sl_disp = f"USDT {pos.get('usdt_sl', 0)}"
-            tp_disp = f"USDT {pos.get('usdt_tp', 0)}"
+            # SL/TP 표시 (USDT 기준을 KRW 추정치로 변환하여 표시)
+            usdt_entry = pos.get('usdt_entry')
+            usdt_sl = pos.get('usdt_sl')
+            usdt_tp = pos.get('usdt_tp')
+            krw_entry = pos['entry_price']
+
+            sl_disp = "-"
+            tp_disp = "-"
+
+            if usdt_entry and usdt_entry > 0:
+                if usdt_sl:
+                    sl_krw = krw_entry * (usdt_sl / usdt_entry)
+                    sl_disp = f"{int(sl_krw):,}원"
+                if usdt_tp:
+                    tp_krw = krw_entry * (usdt_tp / usdt_entry)
+                    tp_disp = f"{int(tp_krw):,}원"
+            
             sl_tp_text = f"SL: {sl_disp} | TP: {tp_disp}"
             
         desc = f"Last Update: {datetime.now().strftime('%H:%M:%S')}"
@@ -196,7 +211,7 @@ async def update_dashboard():
     embed.add_field(name="상태", value=status_text, inline=False)
     embed.add_field(name="진입가", value=entry_text, inline=True)
     embed.add_field(name="평가 손익", value=pnl_text, inline=True)
-    embed.add_field(name="전략 (USDT기준)", value=sl_tp_text, inline=False)
+    embed.add_field(name="전략 (KRW 환산)", value=sl_tp_text, inline=False)
     
     if live_wallet:
         embed.set_footer(text="10초마다 자동 갱신됩니다.")
