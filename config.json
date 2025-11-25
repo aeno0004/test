@@ -1,0 +1,12 @@
+{
+  "DISCORD_TOKEN": "",
+  "DISCORD_DASHBOARD_ID": "",
+  "DISCORD_SIGNAL_ID": "", 
+  "DISCORD_EXPLAIN_ID": "",
+  "GEMINI_API_KEYS": [
+    "",
+    "",
+    "",
+    ""
+  ]
+}
