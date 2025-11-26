@@ -87,12 +87,14 @@ class Backtester:
     def analyze_chunk_strict(self, chunk, api_key, worker_id):
         """
         Gemini 2.5 Flash 무료 티어 제한 준수 작업자
+        [수정됨] 6개 요청 후 1분 휴식 로직 적용
         """
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-2.5-flash')
         
         results = {}
-        request_count = 0
+        request_count = 0   # 일일 총 요청 수
+        batch_count = 0     # 배지(6개) 카운트
         
         print(f"🧵 Worker-{worker_id} 시작 ({len(chunk)}개)")
         
@@ -118,21 +120,29 @@ class Backtester:
             """
             
             try:
-                start_time = time.time()
+                # API 요청
                 response = model.generate_content(prompt)
                 request_count += 1
+                batch_count += 1
                 
                 text = response.text.replace("```json", "").replace("```", "").strip()
                 results[idx] = json.loads(text)
                 
-                # RPM 10 제한 (6.1초 대기)
-                elapsed = time.time() - start_time
-                sleep_time = max(0, 6.1 - elapsed) 
-                time.sleep(sleep_time)
+                # ---------------------------------------------------------
+                # [로직 변경] 6개 요청(Batch) 처리 후 1분 대기
+                # ---------------------------------------------------------
+                if batch_count >= 6:
+                    print(f"⏳ Worker-{worker_id}: 6개 처리 완료 -> 1분 휴식 (Rate Limit 준수)")
+                    time.sleep(60)
+                    batch_count = 0  # 카운터 리셋
+                else:
+                    # 6개가 안 찼더라도, 연속 요청 간 최소 1초 대기 (순간 과부하 방지)
+                    time.sleep(1)
                 
             except Exception as e:
                 print(f"⚠️ Worker-{worker_id} API Error: {e}")
-                time.sleep(10)
+                # 429 에러 등이 발생했을 때도 안전하게 1분 대기
+                time.sleep(60)
                 
         return results
 
@@ -140,7 +150,6 @@ class Backtester:
         # 1. 데이터 수집
         df = self.fetch_data(days, start_date)
         
-        # [수정됨] 데이터가 비어있는지 확인 (오류 방지)
         if df.empty:
             print("❌ 분석할 데이터가 없습니다. (수집 실패)")
             return {
@@ -152,7 +161,6 @@ class Backtester:
             }
 
         if duration_minutes:
-            # 안전장치: index 접근 전 확인
             end_dt = df.index[0] + timedelta(minutes=duration_minutes)
             df = df[df.index <= end_dt]
         
@@ -171,9 +179,13 @@ class Backtester:
         ai_results = {}
         with ThreadPoolExecutor(max_workers=num_keys) as executor:
             futures = []
+            print(f"🚀 {num_keys}개의 키로 병렬 분석 시작 (시차 적용)")
+            
             for i in range(num_keys):
                 if len(chunks[i]) > 0:
                     futures.append(executor.submit(self.analyze_chunk_strict, chunks[i], self.api_keys[i], i+1))
+                    # [추가] Worker들이 동시에 시작해서 API를 폭격하는 것을 방지 (2초 시차)
+                    time.sleep(2)
             
             for future in futures:
                 try:
