@@ -4,7 +4,6 @@ import threading
 from datetime import datetime
 
 class TradeDB:
-    # (기존 코드와 동일)
     def __init__(self, db_name="trading_bot.db"):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.lock = threading.Lock()
@@ -45,11 +44,9 @@ class TradeDB:
             self.conn.commit()
             return cursor.lastrowid 
 
-    # (나머지 DB 메서드들 기존 유지...)
-
 class FuturesWallet:
     def __init__(self, initial_balance=10000000):
-        self.initial_balance = initial_balance # ROI 계산용 원금 저장
+        self.initial_balance = initial_balance 
         self.balance = initial_balance
         self.position = None 
         self.db = TradeDB() 
@@ -58,7 +55,6 @@ class FuturesWallet:
     def get_balance(self):
         return self.balance
     
-    # [NEW] 대쉬보드용 미실현 손익 계산 함수
     def get_unrealized_pnl(self, current_price):
         if not self.position:
             return 0
@@ -74,7 +70,6 @@ class FuturesWallet:
         if self.balance < amount_krw:
             return {"status": "fail", "msg": "Insufficient balance"}
 
-        # Binance Futures Taker Fee 0.04%
         fee = amount_krw * 0.0004
         self.balance -= fee 
         coin_amount = amount_krw / entry_price
@@ -107,7 +102,6 @@ class FuturesWallet:
         if side == 'long': pnl = (exit_price - entry) * amount
         else: pnl = (entry - exit_price) * amount
 
-        # Exit Fee 0.04%
         position_value = exit_price * amount
         fee = position_value * 0.0004
         final_payout = pnl - fee
@@ -131,4 +125,116 @@ class FuturesWallet:
         self.position = None
         return result
 
-    # (기존 update 함수는 main.py에서 직접 제어하므로 필수 아님, 유지해도 됨)
+# ==========================================
+# [추가됨] 백테스팅 전용 DB 클래스
+# ==========================================
+class BacktestDB:
+    def __init__(self, db_name="backtest_results.db"):
+        self.conn = sqlite3.connect(db_name, check_same_thread=False)
+        self.lock = threading.Lock()
+        self.create_tables()
+
+    def create_tables(self):
+        with self.lock:
+            cursor = self.conn.cursor()
+            
+            # 1. 백테스트 실행 기록 (Runs)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS runs (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    executed_at TEXT,
+                    target_days REAL,
+                    initial_balance REAL,
+                    final_balance REAL,
+                    roi REAL,
+                    win_rate REAL,
+                    total_trades INTEGER
+                )
+            ''')
+            
+            # 2. AI 판단 전수 기록 (Decisions)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER,
+                    timestamp TEXT,
+                    decision TEXT,
+                    confidence REAL,
+                    sl REAL,
+                    tp REAL,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                )
+            ''')
+            
+            # 3. 체결된 매매 기록 (Trades)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER,
+                    trade_time TEXT,
+                    roi REAL,
+                    pnl REAL,
+                    reason TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                )
+            ''')
+            self.conn.commit()
+
+    def save_results(self, summary, ai_results, trades):
+        """백테스트 결과 전체를 저장"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            
+            # (1) 실행 기록 저장
+            cursor.execute('''
+                INSERT INTO runs (executed_at, target_days, initial_balance, final_balance, roi, win_rate, total_trades)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                summary.get('days', 0),
+                summary['initial_balance'],
+                summary['final_balance'],
+                summary['roi'],
+                summary['win_rate'],
+                len(trades)
+            ))
+            run_id = cursor.lastrowid
+            
+            # (2) AI 판단 모두 저장 (Bulk Insert)
+            # ai_results는 {timestamp: {json}} 형태
+            decision_data = []
+            for ts, res in ai_results.items():
+                decision_data.append((
+                    run_id,
+                    str(ts), # Timestamp -> String
+                    res.get('decision', 'hold'),
+                    res.get('confidence', 0),
+                    res.get('sl', 0),
+                    res.get('tp', 0)
+                ))
+            
+            if decision_data:
+                cursor.executemany('''
+                    INSERT INTO decisions (run_id, timestamp, decision, confidence, sl, tp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', decision_data)
+                
+            # (3) 체결 내역 저장
+            trade_data = []
+            for t in trades:
+                trade_data.append((
+                    run_id,
+                    str(t['time']),
+                    t['roi'],
+                    t['pnl'],
+                    t['reason']
+                ))
+            
+            if trade_data:
+                cursor.executemany('''
+                    INSERT INTO trades (run_id, trade_time, roi, pnl, reason)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', trade_data)
+                
+            self.conn.commit()
+            return run_id
