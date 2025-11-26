@@ -7,7 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import brain  # 지표 계산용
-from paper_exchange import BacktestDB # [추가] DB 저장을 위해 임포트
+from paper_exchange import BacktestDB 
 
 class Backtester:
     def __init__(self, api_keys, initial_balance=10000000):
@@ -63,6 +63,7 @@ class Backtester:
             df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
             df.set_index('datetime', inplace=True)
             try:
+                # 지표 계산 (EMA, ATR 등 포함)
                 df = brain.calculate_indicators(df)
                 df.dropna(inplace=True)
             except Exception as e:
@@ -71,12 +72,9 @@ class Backtester:
         return df
 
     def call_with_retry(self, model, prompt, worker_id):
-        """
-        [스마트 재시도 로직]
-        429 오류(Resource Exhausted)가 발생하면 대기 시간을 늘려가며 재시도합니다.
-        """
+        """스마트 재시도 로직"""
         max_retries = 5
-        base_wait = 20  # 초기 대기 시간 20초
+        base_wait = 20 
         
         for attempt in range(max_retries):
             try:
@@ -84,22 +82,19 @@ class Backtester:
                 return response
             except Exception as e:
                 err_msg = str(e)
-                # 429 또는 Quota 관련 오류 체크
                 if "429" in err_msg or "Resource has been exhausted" in err_msg or "quota" in err_msg.lower():
-                    wait_time = base_wait * (2 ** attempt) # 20s, 40s, 80s... 점진적 증가
+                    wait_time = base_wait * (2 ** attempt)
                     print(f"⚠️ Worker-{worker_id}: 할당량 초과(429). {wait_time}초 대기 후 재시도... (시도 {attempt+1}/{max_retries})")
                     time.sleep(wait_time)
                 else:
-                    # 그 외 오류(500 등)는 짧게 대기 후 재시도
                     print(f"⚠️ Worker-{worker_id} API Error: {err_msg}")
                     time.sleep(5)
                     if attempt == max_retries - 1: return None
         return None
 
     def analyze_chunk_strict(self, chunk, api_key, worker_id):
-        # [사용자 요청] gemini-2.5-flash 유지
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash') # [유지] 2.5 Flash
         
         results = {}
         request_count = 0
@@ -111,22 +106,48 @@ class Backtester:
                 print(f"🛑 Worker-{worker_id} 안전을 위해 종료 (250회 도달)")
                 break
             
-            data_str = (
-                f"Time: {idx}, Close: {row['close']}, "
-                f"RSI: {row['RSI']:.1f}, MACD: {row['MACD']:.1f}, "
-                f"BB_Pos: {(row['close'] - row['BB_Low']) / (row['BB_Up'] - row['BB_Low']):.2f}"
-            )
+            # [수정] 전문가용 데이터 포맷팅
+            data_str = f"""
+            [Current Market Data (5m Candle)]
+            - Timestamp: {row.name}
+            - Close Price: {row['close']}
+            - Volume Ratio: {row['vol_ratio']:.2f} (vs 20-period Avg)
             
+            [Trend Indicators]
+            - EMA_50: {row['EMA50']:.2f}
+            - EMA_200: {row['EMA200']:.2f}
+            - Trend Status: {'Bullish (Up)' if row['EMA50'] > row['EMA200'] else 'Bearish (Down)'}
+            
+            [Momentum & Volatility]
+            - RSI(14): {row['RSI']:.1f} (Overbought > 70, Oversold < 30)
+            - MACD: {row['MACD']:.2f} (Signal: {row['MACD_Signal']:.2f})
+            - ATR(14): {row['ATR']:.2f} (Use this for SL/TP calculation)
+            - BB Position: {(row['close'] - row['BB_Low']) / (row['BB_Up'] - row['BB_Low']):.2f}
+            """
+            
+            # [수정] 월스트리트 트레이더 페르소나 프롬프트
             prompt = f"""
-            Role: Bitcoin Futures Trading AI.
-            Task: Analyze this 5m candle data.
-            Current Data: {data_str}
+            Act as a World-Class Bitcoin Futures Trader (Scalper).
+            Your goal is to maximize profit while strictly managing risk.
+            
+            Based on the provided 5-minute chart data:
+            1. Analyze the **Trend** using EMA and recent price action.
+            2. Analyze **Momentum** using RSI and MACD.
+            3. Confirm trade validity with **Volume Ratio** (High volume = Stronger signal).
+            4. Determine entry direction (LONG/SHORT) or stay neutral (HOLD).
+            
+            **Risk Management Rules:**
+            - Set Stop Loss (SL) at 1.5 * ATR from entry price.
+            - Set Take Profit (TP) at 2.0 * ATR from entry price (Risk:Reward = 1:1.3+).
+            - If the trend is ambiguous or signals conflict, choose "HOLD".
+            
+            Data:
+            {data_str}
             
             Strict Output JSON:
             {{"decision": "long/short/hold", "confidence": 0-100, "sl": price, "tp": price}}
             """
             
-            # [변경] 스마트 재시도 함수 사용
             response = self.call_with_retry(model, prompt, worker_id)
             
             if response:
@@ -135,9 +156,8 @@ class Backtester:
                     results[idx] = json.loads(text)
                     request_count += 1
                 except:
-                    pass # 파싱 에러 무시
+                    pass 
             
-            # 기본 대기: 너무 빠른 연속 요청 방지
             time.sleep(2) 
                 
         return results
@@ -231,12 +251,15 @@ class Backtester:
                 conf = res.get('confidence', 0)
                 
                 if decision in ['long', 'short'] and conf >= 70:
-                    invest = balance * 0.98
+                    # [백테스트 자금관리] 99% 풀매수
+                    invest = balance * 0.99
                     amount = invest / curr_price
                     balance -= invest
                     
                     sl = res.get('sl')
                     tp = res.get('tp')
+                    
+                    # AI가 ATR 기반 SL/TP를 못 줬을 경우의 안전망 (백테스터는 안전망 필수)
                     if not sl:
                         sl = curr_price * 0.98 if decision == 'long' else curr_price * 1.02
                     
@@ -252,11 +275,10 @@ class Backtester:
         final_roi = ((balance / self.initial_balance) - 1) * 100
         win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
         
-        # [추가] 결과 DB 저장
+        # DB 저장
         try:
             print("💾 백테스팅 결과 DB 저장 중...")
             db = BacktestDB(db_name="backtest_results.db")
-            
             summary = {
                 "days": days,
                 "initial_balance": self.initial_balance,
@@ -264,7 +286,6 @@ class Backtester:
                 "roi": final_roi,
                 "win_rate": win_rate
             }
-            
             run_id = db.save_results(summary, ai_results, trades)
             print(f"✅ 저장 완료 (Run ID: {run_id})")
         except Exception as e:
