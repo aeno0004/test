@@ -13,6 +13,7 @@ import google.generativeai as genai
 from paper_exchange import FuturesWallet 
 from parallel_backtester import Backtester 
 import brain
+import traceback # 상세 에러 로그용
 
 # ==========================================
 # 0. 설정 및 키 관리
@@ -58,31 +59,36 @@ dashboard_msg = None
 binance = ccxt.binanceusdm({
     'options': {
         'defaultType': 'future', # 선물 마켓 강제 지정
-    }
+    },
+    'enableRateLimit': True
 })
 
 # ==========================================
 # 2. 유틸리티 함수 (AI 관련)
 # ==========================================
 async def ask_ai_decision(df):
-    row = df.iloc[-1]
-    data_str = (
-        f"Close: {row['close']}, RSI: {row['RSI']:.1f}, "
-        f"MACD: {row['MACD']:.1f}, BB_Pos: {(row['close'] - row['BB_Low']) / (row['BB_Up'] - row['BB_Low']):.2f}"
-    )
-    
-    prompt = f"""
-    Role: Bitcoin Futures Trading AI.
-    Task: Analyze 5m candle data (Binance USDT).
-    Data: {data_str}
-    
-    Output JSON: {{"decision": "long/short/hold", "confidence": 0-100, "sl": price, "tp": price, "reason": "english reason"}}
-    """
-    
     try:
+        if df.empty: return {"decision": "hold", "confidence": 0}
+        
+        row = df.iloc[-1]
+        data_str = (
+            f"Close: {row['close']}, RSI: {row['RSI']:.1f}, "
+            f"MACD: {row['MACD']:.1f}, BB_Pos: {(row['close'] - row['BB_Low']) / (row['BB_Up'] - row['BB_Low']):.2f}"
+        )
+        
+        prompt = f"""
+        Role: Bitcoin Futures Trading AI.
+        Task: Analyze 5m candle data (Binance USDT).
+        Data: {data_str}
+        
+        Output JSON: {{"decision": "long/short/hold", "confidence": 0-100, "sl": price, "tp": price, "reason": "english reason"}}
+        """
+        
         key = key_manager.get_key()
         genai.configure(api_key=key)
         model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        # 비동기 실행으로 변경
         response = await asyncio.to_thread(model.generate_content, prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
@@ -170,24 +176,27 @@ async def update_dashboard():
             pnl_text = f"{int(unrealized):,}원 ({pnl_rate_curr:+.2f}%)"
             entry_text = f"{int(pos['entry_price']):,}원"
             
-            # SL/TP 표시 (USDT 기준을 KRW 추정치로 변환하여 표시)
+            sl_disp = f"USDT {pos.get('usdt_sl', 0)}"
+            tp_disp = f"USDT {pos.get('usdt_tp', 0)}"
+            
+            # KRW 환산 표시 로직 강화
             usdt_entry = pos.get('usdt_entry')
             usdt_sl = pos.get('usdt_sl')
             usdt_tp = pos.get('usdt_tp')
             krw_entry = pos['entry_price']
 
-            sl_disp = "-"
-            tp_disp = "-"
+            sl_disp_krw = "-"
+            tp_disp_krw = "-"
 
             if usdt_entry and usdt_entry > 0:
                 if usdt_sl:
                     sl_krw = krw_entry * (usdt_sl / usdt_entry)
-                    sl_disp = f"{int(sl_krw):,}원"
+                    sl_disp_krw = f"{int(sl_krw):,}원"
                 if usdt_tp:
                     tp_krw = krw_entry * (usdt_tp / usdt_entry)
-                    tp_disp = f"{int(tp_krw):,}원"
+                    tp_disp_krw = f"{int(tp_krw):,}원"
             
-            sl_tp_text = f"SL: {sl_disp} | TP: {tp_disp}"
+            sl_tp_text = f"SL: {sl_disp_krw} | TP: {tp_disp_krw}"
             
         desc = f"Last Update: {datetime.now().strftime('%H:%M:%S')}"
         
@@ -222,7 +231,6 @@ async def update_dashboard():
         if dashboard_msg:
             await dashboard_msg.edit(embed=embed)
         else:
-            # 기존 메시지 정리 후 새로 전송
             async for msg in ch_dash.history(limit=5):
                 if msg.author == bot.user:
                     await msg.delete()
@@ -241,88 +249,104 @@ async def live_trading_loop():
     if not is_live_active or not live_wallet:
         return
 
-    # 1. 대쉬보드 갱신
-    await update_dashboard()
-
-    # 2. 데이터 수집
+    # [FIX] 전체 로직을 try-except로 감싸서 루프 중단 방지
     try:
+        # 1. 대쉬보드 갱신
+        await update_dashboard()
+
+        # 2. 데이터 수집
         krw_price = pyupbit.get_current_price("KRW-BTC")
-        # [수정] load_markets가 완료된 상태에서 호출됨
-        ohlcv = await asyncio.to_thread(binance.fetch_ohlcv, "BTC/USDT", "5m", limit=50)
-        df_binance = pd.DataFrame(ohlcv, columns=['dt', 'open', 'high', 'low', 'close', 'vol'])
-        df_binance = brain.calculate_indicators(df_binance)
-        current_usdt_price = df_binance['close'].iloc[-1]
-    except Exception as e:
-        print(f"Data Error: {e}")
-        return
-
-    # 3. 포지션 관리
-    if live_wallet.position:
-        pos = live_wallet.position
-        if pos['type'] == 'long':
-            pnl_rate = (krw_price - pos['entry_price']) / pos['entry_price']
-        else:
-            pnl_rate = (pos['entry_price'] - krw_price) / pos['entry_price']
+        
+        # [FIX] fetch_ohlcv 실패 시 루프 중단되지 않도록 처리
+        try:
+            ohlcv = await asyncio.to_thread(binance.fetch_ohlcv, "BTC/USDT", "5m", limit=50)
+            if not ohlcv: # 데이터 없으면 이번 루프 스킵
+                return 
             
-        sl_rate = -0.02
-        tp_rate = 0.04
-        
-        if pos.get('usdt_entry') and pos.get('usdt_sl'):
-            if pos['type'] == 'long':
-                sl_rate = (pos['usdt_sl'] - pos['usdt_entry']) / pos['usdt_entry']
-            else:
-                sl_rate = (pos['usdt_entry'] - pos['usdt_sl']) / pos['usdt_entry']
-        
-        if pos.get('usdt_entry') and pos.get('usdt_tp'):
-            if pos['type'] == 'long':
-                tp_rate = (pos['usdt_tp'] - pos['usdt_entry']) / pos['usdt_entry']
-            else:
-                tp_rate = (pos['usdt_entry'] - pos['usdt_tp']) / pos['usdt_entry']
-
-        close_reason = None
-        if pnl_rate <= sl_rate: close_reason = "Stop Loss 🔵"
-        elif pnl_rate >= tp_rate: close_reason = "Take Profit 🔴"
-        
-        if close_reason:
-            trade_result = live_wallet.close_position(krw_price, reason=close_reason)
-            ch = bot.get_channel(EXPLAIN_ID)
-            if ch:
-                color = 0x00ff00 if trade_result['pnl'] > 0 else 0xff0000
-                embed = discord.Embed(title=f"⚡ 포지션 종료: {close_reason}", color=color)
-                embed.add_field(name="수익금", value=f"{int(trade_result['pnl']):,}원", inline=True)
-                embed.add_field(name="수익률", value=f"{trade_result['profit_rate']:.2f}%", inline=True)
-                await ch.send(embed=embed)
-                
-                if trade_result['pnl'] < 0:
-                    feedback = await analyze_failure(trade_result, df_binance)
-                    embed_fail = discord.Embed(title="😭 전문 트레이더의 팩트 폭격", description=feedback, color=0x000000)
-                    await ch.send(embed=embed_fail)
-
-    # 4. 신규 진입
-    if live_wallet.position is None:
-        if datetime.now().second <= 15: 
-            decision = await ask_ai_decision(df_binance)
+            df_binance = pd.DataFrame(ohlcv, columns=['dt', 'open', 'high', 'low', 'close', 'vol'])
+            df_binance = brain.calculate_indicators(df_binance)
             
-            if decision['confidence'] >= 70 and decision['decision'] in ['long', 'short']:
-                side = decision['decision']
-                reason_kr = await translate_reason(decision.get('reason', 'No reason'))
+            if df_binance.empty: # 데이터프레임 비었으면 스킵
+                return
                 
-                invest = live_wallet.get_balance() * 0.98
-                live_wallet.enter_position(side, krw_price, invest, sl=0, tp=0)
-                
-                live_wallet.position['usdt_entry'] = current_usdt_price
-                live_wallet.position['usdt_sl'] = decision.get('sl')
-                live_wallet.position['usdt_tp'] = decision.get('tp')
+            current_usdt_price = df_binance['close'].iloc[-1]
+        except Exception as e:
+            print(f"Data Fetch Error: {e}")
+            return
 
+        # 3. 포지션 관리
+        if live_wallet.position:
+            pos = live_wallet.position
+            if pos['type'] == 'long':
+                pnl_rate = (krw_price - pos['entry_price']) / pos['entry_price']
+            else:
+                pnl_rate = (pos['entry_price'] - krw_price) / pos['entry_price']
+                
+            sl_rate = -0.02
+            tp_rate = 0.04
+            
+            if pos.get('usdt_entry') and pos.get('usdt_sl'):
+                if pos['type'] == 'long':
+                    sl_rate = (pos['usdt_sl'] - pos['usdt_entry']) / pos['usdt_entry']
+                else:
+                    sl_rate = (pos['usdt_entry'] - pos['usdt_sl']) / pos['usdt_entry']
+            
+            if pos.get('usdt_entry') and pos.get('usdt_tp'):
+                if pos['type'] == 'long':
+                    tp_rate = (pos['usdt_tp'] - pos['usdt_entry']) / pos['usdt_entry']
+                else:
+                    tp_rate = (pos['usdt_entry'] - pos['usdt_tp']) / pos['usdt_entry']
+
+            close_reason = None
+            if pnl_rate <= sl_rate: close_reason = "Stop Loss 🔵"
+            elif pnl_rate >= tp_rate: close_reason = "Take Profit 🔴"
+            
+            if close_reason:
+                trade_result = live_wallet.close_position(krw_price, reason=close_reason)
                 ch = bot.get_channel(EXPLAIN_ID)
                 if ch:
-                    embed = discord.Embed(title=f"🚀 AI 진입 신호: {side.upper()}", color=0x0000ff)
-                    embed.add_field(name="확신도", value=f"{decision['confidence']}%", inline=True)
-                    embed.add_field(name="진입가(KRW)", value=f"{int(krw_price):,}원", inline=True)
-                    embed.add_field(name="판단 이유", value=reason_kr, inline=False)
+                    color = 0x00ff00 if trade_result['pnl'] > 0 else 0xff0000
+                    embed = discord.Embed(title=f"⚡ 포지션 종료: {close_reason}", color=color)
+                    embed.add_field(name="수익금", value=f"{int(trade_result['pnl']):,}원", inline=True)
+                    embed.add_field(name="수익률", value=f"{trade_result['profit_rate']:.2f}%", inline=True)
                     await ch.send(embed=embed)
+                    
+                    if trade_result['pnl'] < 0:
+                        feedback = await analyze_failure(trade_result, df_binance)
+                        embed_fail = discord.Embed(title="😭 전문 트레이더의 팩트 폭격", description=feedback, color=0x000000)
+                        await ch.send(embed=embed_fail)
+
+        # 4. 신규 진입
+        if live_wallet.position is None:
+            if datetime.now().second <= 15: 
+                decision = await ask_ai_decision(df_binance)
                 
-                await update_dashboard()
+                if decision['confidence'] >= 70 and decision['decision'] in ['long', 'short']:
+                    side = decision['decision']
+                    reason_kr = await translate_reason(decision.get('reason', 'No reason'))
+                    
+                    invest = live_wallet.get_balance() * 0.98
+                    live_wallet.enter_position(side, krw_price, invest, sl=0, tp=0)
+                    
+                    live_wallet.position['usdt_entry'] = current_usdt_price
+                    live_wallet.position['usdt_sl'] = decision.get('sl')
+                    live_wallet.position['usdt_tp'] = decision.get('tp')
+
+                    ch = bot.get_channel(EXPLAIN_ID)
+                    if ch:
+                        embed = discord.Embed(title=f"🚀 AI 진입 신호: {side.upper()}", color=0x0000ff)
+                        embed.add_field(name="확신도", value=f"{decision['confidence']}%", inline=True)
+                        embed.add_field(name="진입가(KRW)", value=f"{int(krw_price):,}원", inline=True)
+                        embed.add_field(name="판단 이유", value=reason_kr, inline=False)
+                        await ch.send(embed=embed)
+                    
+                    await update_dashboard()
+
+    except Exception as e:
+        print(f"🔥 Live Loop Critical Error: {e}")
+        traceback.print_exc() # 상세 에러 출력
+        # 에러 발생해도 루프는 계속 돌도록 pass (혹은 잠시 대기)
+        await asyncio.sleep(5)
 
 # ==========================================
 # 4. 명령어 처리
@@ -340,7 +364,13 @@ async def start_live_trading(ctx):
     dashboard_msg = None 
     
     await ctx.send("🚀 **AI 실전 모의투자**를 시작합니다! (초기자금: 100만원)")
-    await update_dashboard()
+    
+    # [FIX] 루프 시작 전 대쉬보드 갱신
+    try:
+        await update_dashboard()
+    except Exception as e:
+        print(f"Initial Dashboard Error: {e}")
+
     live_trading_loop.start()
 
 @bot.command(name="테스트매매종료")
@@ -368,7 +398,7 @@ async def start_backtest(ctx, arg1: str, arg2: str = None):
 async def on_ready():
     print(f"✅ {bot.user} 접속 성공!")
     
-    # [FIX] 바이낸스 마켓 정보 미리 로드 (에러 방지)
+    # [FIX] 바이낸스 마켓 정보 미리 로드
     try:
         print("⏳ 바이낸스 마켓 데이터 로딩 중...")
         await asyncio.to_thread(binance.load_markets)
@@ -376,7 +406,7 @@ async def on_ready():
     except Exception as e:
         print(f"❌ 바이낸스 로딩 실패: {e}")
         
-    # [FIX] 봇 켜지자마자 대쉬보드 출력 (대기 상태)
+    # [FIX] 봇 켜지자마자 대쉬보드 출력
     await update_dashboard()
 
 bot.run(TOKEN)
