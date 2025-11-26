@@ -472,12 +472,16 @@ async def stop_live_trading(ctx):
 @bot.command(name="종료")
 async def shutdown(ctx):
     global dashboard_msg, key_dashboard_msg
+    # 대쉬보드 메시지 삭제
     if dashboard_msg:
         try: await dashboard_msg.delete()
         except: pass
+    
+    # 키 관리 메시지 삭제
     if key_dashboard_msg:
         try: await key_dashboard_msg.delete()
         except: pass
+        
     await ctx.send("🤖 봇을 종료합니다. 안녕히 계세요!")
     await bot.close()
 
