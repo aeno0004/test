@@ -14,6 +14,7 @@ from paper_exchange import FuturesWallet
 from parallel_backtester import Backtester 
 import brain
 import traceback
+import re
 
 # ==========================================
 # 0. 설정 및 키 관리
@@ -24,8 +25,25 @@ if not os.path.exists(CONFIG_FILE):
     print(f"❌ 오류: '{CONFIG_FILE}' 파일이 없습니다.")
     sys.exit()
 
-with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-    config = json.load(f)
+def load_sanitized_json(filepath):
+    """JSON 파일에서 제어 문자 제거 후 로드"""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+        # 제어 문자 제거 (줄바꿈, 탭 제외)
+        # \x00-\x1f 중 \n(0x0a), \r(0x0d), \t(0x09) 제외하고 제거
+        sanitized_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content)
+        
+        try:
+            return json.loads(sanitized_content)
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON 파싱 오류: {e}")
+            print(f"Content around error: {sanitized_content[max(0, e.pos-20):min(len(sanitized_content), e.pos+20)]}")
+            sys.exit()
+        except Exception as e:
+            print(f"❌ 설정 파일 로드 중 알 수 없는 오류: {e}")
+            sys.exit()
+
+config = load_sanitized_json(CONFIG_FILE)
     
 TOKEN = config['DISCORD_TOKEN']
 DASHBOARD_ID = int(config.get('DISCORD_DASHBOARD_ID', 0))
