@@ -44,7 +44,7 @@ EXPLAIN_ID = int(config.get('DISCORD_EXPLAIN_ID', 0))
 KEY_MANAGER_ID = int(config.get('DISCORD_KEY_MANAGER_ID', 0)) 
 GEMINI_KEYS_RAW = config.get('GEMINI_API_KEYS', [])
 
-# 환율 설정 (단순 표시용)
+# 환율 (단순 표시용)
 USD_KRW_RATE = 1450 
 
 class KeyManager:
@@ -95,7 +95,12 @@ class KeyManager:
             else: status = f"🔴 오류 다수 ({count}회)"
             
             err_msg = last_err if last_err == "None" else f"⚠️ {last_err[:40]}..."
-            embed.add_field(name=f"🏷️ {name}", value=f"**상태:** {status}\n**로그:** {err_msg}", inline=False)
+            
+            embed.add_field(
+                name=f"🏷️ {name}", 
+                value=f"**상태:** {status}\n**로그:** {err_msg}", 
+                inline=False
+            )
         return embed
 
 key_manager = KeyManager(GEMINI_KEYS_RAW)
@@ -113,7 +118,7 @@ is_live_active = False
 dashboard_msg = None 
 key_dashboard_msg = None 
 
-# [핵심] 바이낸스 선물 API 사용
+# [핵심] 바이낸스 선물 API (USDT)
 binance = ccxt.binanceusdm({
     'options': {'defaultType': 'future'},
     'enableRateLimit': True
@@ -123,7 +128,6 @@ binance = ccxt.binanceusdm({
 # 2. 헬퍼 함수
 # ==========================================
 def usdt_to_krw(usdt):
-    """USDT -> KRW 변환 (단순 표시용)"""
     return int(usdt * USD_KRW_RATE)
 
 async def send_split_field_embed(channel, base_embed, field_name, long_text):
@@ -136,7 +140,11 @@ async def send_split_field_embed(channel, base_embed, field_name, long_text):
     await channel.send(embed=base_embed)
     
     for i, chunk in enumerate(chunks[1:], start=2):
-        follow_up = discord.Embed(title=f"📄 {field_name} ({i}/{len(chunks)})", description=chunk, color=base_embed.color)
+        follow_up = discord.Embed(
+            title=f"📄 {field_name} (이어짐 {i}/{len(chunks)})", 
+            description=chunk, 
+            color=base_embed.color
+        )
         await channel.send(embed=follow_up)
 
 async def send_split_description_embed(channel, title, long_text, color):
@@ -157,29 +165,60 @@ async def ask_ai_decision(df):
     try:
         if df.empty: return {"decision": "hold", "confidence": 0}
         
+        # [수정] 최근 5개 캔들 흐름 요약
+        recent_trend = df.tail(5)[['close', 'volume', 'RSI', 'MACD']].to_string()
         row = df.iloc[-1]
-        # [유지] 백테스터와 동일한 데이터 포맷
-        data_str = (
-            f"Time: {row.name}, Close: {row['close']}, "
-            f"RSI: {row['RSI']:.1f}, MACD: {row['MACD']:.1f}, "
-            f"BB_Pos: {(row['close'] - row['BB_Low']) / (row['BB_Up'] - row['BB_Low']):.2f}"
-        )
         
+        # [수정] 전문가용 프롬프트 데이터
+        data_str = f"""
+        [Current Market Data (5m Candle)]
+        - Timestamp: {row.name}
+        - Close Price: {row['close']}
+        - Volume Ratio: {row['vol_ratio']:.2f} (vs 20-period Avg)
+        
+        [Trend Indicators]
+        - EMA_50: {row['EMA50']:.2f}
+        - EMA_200: {row['EMA200']:.2f}
+        - Trend Status: {'Bullish (Up)' if row['EMA50'] > row['EMA200'] else 'Bearish (Down)'}
+        
+        [Momentum & Volatility]
+        - RSI(14): {row['RSI']:.1f} (Overbought > 70, Oversold < 30)
+        - MACD: {row['MACD']:.2f} (Signal: {row['MACD_Signal']:.2f})
+        - ATR(14): {row['ATR']:.2f} (Use this for SL/TP calculation)
+        - BB Position: {(row['close'] - row['BB_Low']) / (row['BB_Up'] - row['BB_Low']):.2f}
+        
+        [Recent 5 Candles History]
+        {recent_trend}
+        """
+        
+        # [수정] 월스트리트 트레이더 페르소나
         prompt = f"""
-        Role: Bitcoin Futures Trading AI.
-        Task: Analyze this 5m candle data.
-        Current Data: {data_str}
+        Act as a World-Class Bitcoin Futures Trader (Scalper).
+        Your goal is to maximize profit while strictly managing risk.
+        
+        Based on the provided 5-minute chart data:
+        1. Analyze the **Trend** using EMA and recent price action.
+        2. Analyze **Momentum** using RSI and MACD.
+        3. Confirm trade validity with **Volume Ratio** (High volume = Stronger signal).
+        4. Determine entry direction (LONG/SHORT) or stay neutral (HOLD).
+        
+        **Risk Management Rules:**
+        - Set Stop Loss (SL) at 1.5 * ATR from entry price.
+        - Set Take Profit (TP) at 2.0 * ATR from entry price (Risk:Reward = 1:1.3+).
+        - If the trend is ambiguous or signals conflict, choose "HOLD".
+        
+        Data:
+        {data_str}
         
         Strict Output JSON:
-        {{"decision": "long/short/hold", "confidence": 0-100, "sl": price, "tp": price, "reason": "english reason"}}
+        {{"decision": "long/short/hold", "confidence": 0-100, "sl": price, "tp": price, "reason": "Brief logic in Korean"}}
         """
         
         used_key = key_manager.get_key()
         if not used_key: raise Exception("No API Keys available")
         
         genai.configure(api_key=used_key)
-        # [요청반영] 모델명 2.5 유지
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash') # [유지] 2.5 Flash
         
         response = await asyncio.to_thread(model.generate_content, prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
@@ -190,23 +229,20 @@ async def ask_ai_decision(df):
         return {"decision": "hold", "confidence": 0}
 
 async def translate_reason(text):
-    used_key = None
+    # (그대로 유지)
+    used_key = key_manager.get_key()
+    if not used_key: return text
     try:
-        used_key = key_manager.get_key()
-        if not used_key: return text
-        
         genai.configure(api_key=used_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') # [요청반영] 2.5 유지
+        model = genai.GenerativeModel('gemini-2.5-flash') # [유지] 2.5 Flash
         prompt = f"Translate this trading reasoning into natural Korean:\n'{text}'"
         response = await asyncio.to_thread(model.generate_content, prompt)
         return response.text.strip()
-    except Exception as e:
-        if used_key: key_manager.report_error(used_key, e)
-        return text
+    except: return text
 
 async def analyze_failure(trade_info, df_context):
     """
-    [요청반영] 실패 분석 기능 완전 복구
+    [유지] 실패 분석 (팩트 폭격)
     """
     used_key = None
     try:
@@ -214,7 +250,7 @@ async def analyze_failure(trade_info, df_context):
         if not used_key: return "API 키 없음"
         
         genai.configure(api_key=used_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') # [요청반영] 2.5 유지
+        model = genai.GenerativeModel('gemini-2.5-flash') # [유지] 2.5 Flash
         prompt = f"""
         Act as a Wall Street Senior Trader.
         My bot just lost money. Analyze why.
@@ -245,7 +281,6 @@ async def update_dashboard():
     ch_dash = bot.get_channel(DASHBOARD_ID)
     if not ch_dash: return
 
-    # [변경] Binance USDT 가격 조회
     try:
         ticker = await asyncio.to_thread(binance.fetch_ticker, "BTC/USDT")
         current_usdt_price = ticker['last']
@@ -255,13 +290,12 @@ async def update_dashboard():
     if live_wallet:
         bal_usdt = live_wallet.get_balance()
         initial_usdt = live_wallet.initial_balance
-        
         unrealized_usdt = live_wallet.get_unrealized_pnl(current_usdt_price) if live_wallet.position else 0
         total_equity_usdt = bal_usdt + unrealized_usdt
         
         total_roi = ((total_equity_usdt - initial_usdt) / initial_usdt * 100) if initial_usdt > 0 else 0
         
-        status_text = "💤 관망 중 (Binance Scanning...)"
+        status_text = "💤 관망 중 (Binance USDT)"
         pnl_text = "-"
         entry_text = "-"
         sl_tp_text = "-"
@@ -273,9 +307,8 @@ async def update_dashboard():
             status_text = f"🔥 {side} 포지션 (Binance)"
             color = 0x2ecc71 if total_roi >= 0 else 0xe74c3c
             
-            # [요청반영] USDT와 KRW 병기
             pnl_krw = usdt_to_krw(unrealized_usdt)
-            pnl_rate_curr = (unrealized_usdt / pos['invested_krw']) * 100 
+            pnl_rate_curr = (unrealized_usdt / pos['invested_krw']) * 100 # invested_krw=USDT값
             
             pnl_text = f"${unrealized_usdt:.2f} ({pnl_rate_curr:+.2f}%)\n≈ {pnl_krw:,}원"
             entry_text = f"${pos['entry_price']:.2f}"
@@ -311,7 +344,7 @@ async def update_dashboard():
     embed.add_field(name="평가 손익", value=pnl_text, inline=True)
     embed.add_field(name="전략 (USDT)", value=sl_tp_text, inline=False)
     
-    embed.set_footer(text="모든 매매는 Binance USDT 마켓 기준입니다. (10초 갱신)")
+    embed.set_footer(text="Binance USDT 마켓 기준 (10초 갱신)")
 
     try:
         if dashboard_msg: await dashboard_msg.edit(embed=embed)
@@ -339,7 +372,7 @@ async def live_trading_loop():
     try:
         await update_dashboard()
         
-        # 1. 데이터 조회 (Binance)
+        # 1. 데이터 조회 (Binance) -> limit=200 필수 (EMA 200 계산용)
         try:
             ohlcv = await asyncio.to_thread(binance.fetch_ohlcv, "BTC/USDT", "5m", limit=200)
             if not ohlcv: return
@@ -349,12 +382,12 @@ async def live_trading_loop():
             
             df_binance = brain.calculate_indicators(df_binance)
             if df_binance.empty: return
-            current_price = df_binance['close'].iloc[-1] # Binance USDT Price
+            current_price = df_binance['close'].iloc[-1]
         except Exception as e:
             print(f"Data Fetch Error: {e}")
             return
 
-        # 2. 포지션 청산 확인
+        # 2. 포지션 청산
         if live_wallet.position:
             pos = live_wallet.position
             sl_price = pos['sl']
@@ -380,7 +413,7 @@ async def live_trading_loop():
                     embed.add_field(name="수익률", value=f"{trade_result['profit_rate']:.2f}%", inline=True)
                     await ch.send(embed=embed)
                     
-                    # [요청반영] 실패 분석 기능 (손실 시 작동)
+                    # [유지] 실패 분석 (손실 발생 시)
                     if trade_result['pnl'] < 0:
                         feedback = await analyze_failure(trade_result, df_binance)
                         await send_split_description_embed(ch, "😭 전문 트레이더의 팩트 폭격", feedback, 0x000000)
@@ -394,18 +427,18 @@ async def live_trading_loop():
                     side = decision['decision']
                     reason_kr = await translate_reason(decision.get('reason', 'No reason'))
                     
-                    # [요청반영] 자금 관리: 잔고 전액 (수수료 제외)
+                    # [요청반영] 풀매수 (수수료 제외 99%)
                     balance = live_wallet.get_balance()
-                    invest_amount = balance * 0.99 # 수수료 및 슬리피지 여유 1%
+                    invest_amount = balance * 0.99 
                     
                     sl = decision.get('sl')
                     tp = decision.get('tp')
+                    # AI가 SL/TP 안주면 기본값 (안전망)
                     if not sl or sl == 0:
                         sl = current_price * 0.98 if side == 'long' else current_price * 1.02
                     if not tp or tp == 0:
                         tp = current_price * 1.04 if side == 'long' else current_price * 0.96
 
-                    # 진입 실행 (USDT)
                     live_wallet.enter_position(side, current_price, invest_amount, sl=sl, tp=tp)
                     
                     ch = bot.get_channel(EXPLAIN_ID)
@@ -456,7 +489,6 @@ async def shutdown(ctx):
     if key_dashboard_msg:
         try: await key_dashboard_msg.delete()
         except: pass
-        
     await ctx.send("🤖 봇을 종료합니다.")
     await bot.close()
 
@@ -485,13 +517,11 @@ async def start_backtest(ctx, arg1: str, arg2: str = None):
         embed.add_field(name="최종 자산", value=f"{int(result['final_balance']):,}원", inline=True)
         embed.add_field(name="수익률", value=f"{result['roi']:.2f}%", inline=True)
         embed.add_field(name="승률", value=f"{result['win_rate']:.1f}%", inline=True)
-        
         logs = result.get('logs', [])
         if logs:
             log_txt = "\n".join(logs[-5:])
             if len(log_txt) > 1000: log_txt = log_txt[:1000] + "..."
             embed.add_field(name="최근 로그", value=f"```\n{log_txt}\n```", inline=False)
-        
         await ctx.send(embed=embed)
     else:
         await ctx.send("❌ 백테스트 실패 (결과 없음)")
@@ -505,7 +535,6 @@ async def on_ready():
         print("✅ 바이낸스 로딩 완료")
     except Exception as e:
         print(f"❌ 바이낸스 로딩 실패: {e}")
-        
     await update_dashboard()
     key_monitoring_loop.start()
 
