@@ -7,6 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import brain  # 지표 계산용
+from paper_exchange import BacktestDB # [추가] DB 저장을 위해 임포트
 
 class Backtester:
     def __init__(self, api_keys, initial_balance=10000000):
@@ -168,10 +169,7 @@ class Backtester:
             futures = []
             for i in range(num_keys):
                 if len(chunks[i]) > 0:
-                    # [수정된 부분] 괄호와 인자가 정확히 들어간 라인
                     futures.append(executor.submit(self.analyze_chunk_strict, chunks[i], self.api_keys[i], i+1))
-                    
-                    # [변경] 쓰레드 시작 간격을 5초로 설정 (부하 분산)
                     print(f"⏳ Worker-{i+1} 준비 중... (5초 대기)")
                     time.sleep(5)
             
@@ -182,7 +180,7 @@ class Backtester:
                 except Exception as e:
                     print(f"Worker Exception: {e}")
 
-        # 4. 시뮬레이션 (기존과 동일)
+        # 4. 시뮬레이션
         print("\n🚀 시뮬레이션 정산 시작...")
         balance = self.initial_balance
         position = None
@@ -195,7 +193,7 @@ class Backtester:
         for idx, row in df.iterrows():
             curr_price = row['close']
             
-            # 청산
+            # 청산 로직
             if position:
                 side = position['side']
                 entry_price = position['entry_price']
@@ -226,7 +224,7 @@ class Backtester:
                     total_trades += 1
                     position = None
             
-            # 진입
+            # 진입 로직
             if position is None and idx in ai_results:
                 res = ai_results[idx]
                 decision = res.get('decision', 'hold').lower()
@@ -254,6 +252,24 @@ class Backtester:
         final_roi = ((balance / self.initial_balance) - 1) * 100
         win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
         
+        # [추가] 결과 DB 저장
+        try:
+            print("💾 백테스팅 결과 DB 저장 중...")
+            db = BacktestDB(db_name="backtest_results.db")
+            
+            summary = {
+                "days": days,
+                "initial_balance": self.initial_balance,
+                "final_balance": balance,
+                "roi": final_roi,
+                "win_rate": win_rate
+            }
+            
+            run_id = db.save_results(summary, ai_results, trades)
+            print(f"✅ 저장 완료 (Run ID: {run_id})")
+        except Exception as e:
+            print(f"❌ DB 저장 실패: {e}")
+
         return {
             "final_balance": balance,
             "roi": final_roi,
