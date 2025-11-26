@@ -30,14 +30,12 @@ def load_sanitized_json(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
         # 제어 문자 제거 (줄바꿈, 탭 제외)
-        # \x00-\x1f 중 \n(0x0a), \r(0x0d), \t(0x09) 제외하고 제거
         sanitized_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content)
         
         try:
             return json.loads(sanitized_content)
         except json.JSONDecodeError as e:
             print(f"❌ JSON 파싱 오류: {e}")
-            print(f"Content around error: {sanitized_content[max(0, e.pos-20):min(len(sanitized_content), e.pos+20)]}")
             sys.exit()
         except Exception as e:
             print(f"❌ 설정 파일 로드 중 알 수 없는 오류: {e}")
@@ -48,18 +46,17 @@ config = load_sanitized_json(CONFIG_FILE)
 TOKEN = config['DISCORD_TOKEN']
 DASHBOARD_ID = int(config.get('DISCORD_DASHBOARD_ID', 0))
 EXPLAIN_ID = int(config.get('DISCORD_EXPLAIN_ID', 0))
-KEY_MANAGER_ID = int(config.get('DISCORD_KEY_MANAGER_ID', 0)) # 키 관리 채널 ID
+KEY_MANAGER_ID = int(config.get('DISCORD_KEY_MANAGER_ID', 0)) 
 GEMINI_KEYS_RAW = config.get('GEMINI_API_KEYS', [])
 
 class KeyManager:
     def __init__(self, keys_raw):
         self.keys = []
         self.key_names = {}
-        self.error_counts = {} # key -> count
-        self.last_errors = {}  # key -> error msg
+        self.error_counts = {} 
+        self.last_errors = {} 
         self.idx = 0
         
-        # 키 파싱 (APIKEY:이름)
         for item in keys_raw:
             if ':' in item:
                 k, name = item.split(':', 1)
@@ -81,13 +78,11 @@ class KeyManager:
         return k
     
     def report_error(self, key, error):
-        """오류 발생 시 카운트 증가 및 로그 저장"""
         if key in self.error_counts:
             self.error_counts[key] += 1
             self.last_errors[key] = str(error)
             
     def get_status_embed(self):
-        """키 상태 모니터링 임베드 생성"""
         embed = discord.Embed(title="🔑 API Key 상태 모니터링", color=0x9b59b6)
         embed.description = f"총 {len(self.keys)}개의 키가 로드되었습니다."
         embed.set_footer(text=f"Last Update: {datetime.now().strftime('%H:%M:%S')} | 10초 주기 갱신")
@@ -97,7 +92,6 @@ class KeyManager:
             count = self.error_counts[k]
             last_err = self.last_errors[k]
             
-            # 상태 아이콘
             if count == 0:
                 status = "🟢 정상"
             elif count < 5:
@@ -105,7 +99,6 @@ class KeyManager:
             else:
                 status = f"🔴 오류 다수 ({count}회)"
             
-            # 에러 메시지 짧게
             err_msg = last_err if last_err == "None" else f"⚠️ {last_err[:40]}..."
             
             embed.add_field(
@@ -124,14 +117,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Backtester에는 순수 키 리스트만 전달
 backtester = Backtester(api_keys=key_manager.keys)
 live_wallet = None 
 is_live_active = False
 dashboard_msg = None 
-key_dashboard_msg = None # 키 매니저 메시지용
+key_dashboard_msg = None 
 
-# 바이낸스 객체 생성
 binance = ccxt.binanceusdm({
     'options': {
         'defaultType': 'future',
@@ -140,7 +131,7 @@ binance = ccxt.binanceusdm({
 })
 
 # ==========================================
-# 2. 헬퍼 함수 (긴 텍스트 분할 전송)
+# 2. 헬퍼 함수
 # ==========================================
 async def send_split_field_embed(channel, base_embed, field_name, long_text):
     limit = 1000 
@@ -350,7 +341,6 @@ async def update_dashboard():
         except:
             pass
 
-# [NEW] 키 상태 모니터링 루프
 @tasks.loop(seconds=10)
 async def key_monitoring_loop():
     global key_dashboard_msg
@@ -363,7 +353,6 @@ async def key_monitoring_loop():
         if key_dashboard_msg:
             await key_dashboard_msg.edit(embed=embed)
         else:
-            # 이전 메시지 정리 (봇 메시지만)
             async for msg in ch.history(limit=10):
                 if msg.author == bot.user:
                     await msg.delete()
@@ -490,12 +479,9 @@ async def stop_live_trading(ctx):
 @bot.command(name="종료")
 async def shutdown(ctx):
     global dashboard_msg, key_dashboard_msg
-    # 대쉬보드 메시지 삭제
     if dashboard_msg:
         try: await dashboard_msg.delete()
         except: pass
-    
-    # 키 관리 메시지 삭제
     if key_dashboard_msg:
         try: await key_dashboard_msg.delete()
         except: pass
@@ -505,8 +491,54 @@ async def shutdown(ctx):
 
 @bot.command(name="백테스트")
 async def start_backtest(ctx, arg1: str, arg2: str = None):
-    await ctx.send(f"⏳ 백테스트 요청 확인... (병렬 엔진 가동)")
-    result = await asyncio.to_thread(backtester.run, float(arg1))
+    """
+    사용법:
+    1. !백테스트 30  (최근 30일)
+    2. !백테스트 2024-01-01 1440 (특정 날짜)
+    """
+    try:
+        # Case 1: 실수형(일수) 입력 시
+        days = float(arg1)
+        await ctx.send(f"⏳ 최근 {days}일 백테스트 시작...")
+        result = await asyncio.to_thread(backtester.run, days=days)
+    except ValueError:
+        # Case 2: 날짜형 입력 시
+        if arg2 is None:
+            await ctx.send("❌ 사용법 오류: `!백테스트 7` 또는 `!백테스트 2024-01-01 1440`")
+            return
+        
+        try:
+            # 날짜 형식 체크
+            datetime.strptime(arg1, "%Y-%m-%d")
+            duration = int(arg2)
+            
+            # 날짜가 지정되면 days는 기간 계산용으로만 사용됨 (Backtester 내부 로직)
+            # 안전하게 넉넉한 days 전달
+            days_needed = (duration / 1440) + 2
+            
+            await ctx.send(f"⏳ {arg1}부터 {duration}분간 백테스트 시작...")
+            result = await asyncio.to_thread(backtester.run, days=days_needed, start_date=arg1, duration_minutes=duration)
+            
+        except ValueError:
+             await ctx.send("❌ 날짜 형식(YYYY-MM-DD) 또는 기간(분)이 잘못되었습니다.")
+             return
+
+    # 결과 출력
+    if result:
+        embed = discord.Embed(title="📊 백테스트 결과", color=0x9b59b6)
+        embed.add_field(name="최종 자산", value=f"{int(result['final_balance']):,}원", inline=True)
+        embed.add_field(name="수익률", value=f"{result['roi']:.2f}%", inline=True)
+        embed.add_field(name="승률", value=f"{result['win_rate']:.1f}%", inline=True)
+        
+        logs = result.get('logs', [])
+        if logs:
+            log_txt = "\n".join(logs[-5:])
+            if len(log_txt) > 1000: log_txt = log_txt[:1000] + "..."
+            embed.add_field(name="최근 로그", value=f"```\n{log_txt}\n```", inline=False)
+        
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("❌ 백테스트 실패 (결과 없음)")
 
 @bot.event
 async def on_ready():
@@ -520,7 +552,6 @@ async def on_ready():
         print(f"❌ 바이낸스 로딩 실패: {e}")
         
     await update_dashboard()
-    # [NEW] 키 모니터링 시작
     key_monitoring_loop.start()
 
 bot.run(TOKEN)
