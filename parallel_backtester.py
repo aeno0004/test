@@ -13,7 +13,12 @@ class Backtester:
         self.api_keys = api_keys
         self.initial_balance = initial_balance
         # 바이낸스 퍼블릭 API (데이터 수집용, 키 불필요)
-        self.exchange = ccxt.binanceusdm() 
+        self.exchange = ccxt.binanceusdm({
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'future',
+            }
+        })
 
     def fetch_data(self, days, start_date=None):
         """바이낸스 선물 데이터 수집 (CCXT 사용)"""
@@ -23,58 +28,77 @@ class Backtester:
         
         all_ohlcv = []
         
+        # 시작 시간 계산
         if start_date:
-            since = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
+            try:
+                dt_obj = datetime.strptime(start_date, "%Y-%m-%d")
+                since = int(dt_obj.timestamp() * 1000)
+            except ValueError:
+                print("❌ 날짜 형식이 잘못되었습니다. (YYYY-MM-DD)")
+                return pd.DataFrame()
         else:
             since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
         
         now = int(datetime.now().timestamp() * 1000)
         
-        print(f"📥 바이낸스 데이터 수집 중... (Start: {datetime.fromtimestamp(since/1000)})")
+        print(f"📥 데이터 수집 시작... Target: {datetime.fromtimestamp(since/1000)}")
         
         while since < now:
             try:
+                # 데이터 조회
                 ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit, since=since)
-                if not ohlcv: break
+                
+                if not ohlcv:
+                    print("⚠️ 더 이상 가져올 데이터가 없습니다 (Empty response).")
+                    break
                 
                 all_ohlcv.extend(ohlcv)
-                since = ohlcv[-1][0] + 300000 # +5분
+                
+                # 다음 조회 시점 갱신 (마지막 데이터 시간 + 5분)
+                last_timestamp = ohlcv[-1][0]
+                since = last_timestamp + 300000 
+                
+                print(f"   -> {len(ohlcv)}개 수집 완료 (Last: {datetime.fromtimestamp(last_timestamp/1000)})")
                 time.sleep(0.1)
                 
                 # 요청 기간 충족 시 조기 종료
                 if start_date and len(all_ohlcv) * 5 > days * 1440:
                      break
+
             except Exception as e:
-                print(f"⚠️ 데이터 수집 에러: {e}")
+                print(f"❌ 데이터 수집 중 치명적 오류: {e}")
+                print("💡 팁: 한국에서는 VPN을 켜야 바이낸스 접속이 될 수 있습니다.")
                 break
                 
         df = pd.DataFrame(all_ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
-        df.set_index('datetime', inplace=True)
+        if not df.empty:
+            df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+            df.set_index('datetime', inplace=True)
+            
+            # 지표 계산 (brain.py)
+            try:
+                df = brain.calculate_indicators(df)
+                df.dropna(inplace=True)
+            except Exception as e:
+                print(f"❌ 지표 계산 오류: {e}")
         
-        # 지표 계산 (brain.py)
-        df = brain.calculate_indicators(df)
-        df.dropna(inplace=True)
         return df
 
     def analyze_chunk_strict(self, chunk, api_key, worker_id):
         """
         Gemini 2.5 Flash 무료 티어 제한 준수 작업자
-        - RPM 10 (6초당 1회)
-        - RPD 250 (일일 250회 제한)
         """
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') # 2.5 버전 사용
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
         results = {}
         request_count = 0
         
-        print(f"🧵 Worker-{worker_id} 시작 (할당량: {len(chunk)}개)")
+        print(f"🧵 Worker-{worker_id} 시작 ({len(chunk)}개)")
         
         for idx, row in chunk.iterrows():
-            # RPD(일일 제한) 체크
             if request_count >= 250:
-                print(f"🛑 Worker-{worker_id} 일일 제한(250회) 도달로 중단.")
+                print(f"🛑 Worker-{worker_id} 일일 제한(250회) 도달.")
                 break
             
             # 데이터 포맷팅
@@ -94,7 +118,6 @@ class Backtester:
             """
             
             try:
-                # API 호출
                 start_time = time.time()
                 response = model.generate_content(prompt)
                 request_count += 1
@@ -102,15 +125,13 @@ class Backtester:
                 text = response.text.replace("```json", "").replace("```", "").strip()
                 results[idx] = json.loads(text)
                 
-                # RPM 10 제한 준수 (6초 대기)
-                # 처리 시간을 뺀 나머지만 대기하여 정확히 6초 간격 유지
+                # RPM 10 제한 (6.1초 대기)
                 elapsed = time.time() - start_time
                 sleep_time = max(0, 6.1 - elapsed) 
                 time.sleep(sleep_time)
                 
             except Exception as e:
-                # 에러 발생 시(429 등) 더 길게 대기
-                print(f"⚠️ Worker-{worker_id} Error: {e}")
+                print(f"⚠️ Worker-{worker_id} API Error: {e}")
                 time.sleep(10)
                 
         return results
@@ -118,24 +139,35 @@ class Backtester:
     def run(self, days, start_date=None, duration_minutes=None):
         # 1. 데이터 수집
         df = self.fetch_data(days, start_date)
+        
+        # [수정됨] 데이터가 비어있는지 확인 (오류 방지)
+        if df.empty:
+            print("❌ 분석할 데이터가 없습니다. (수집 실패)")
+            return {
+                "final_balance": self.initial_balance,
+                "roi": 0,
+                "win_rate": 0,
+                "trades": [],
+                "logs": ["❌ 데이터 수집 실패: VPN을 확인하거나 날짜를 다시 확인해주세요."]
+            }
+
         if duration_minutes:
+            # 안전장치: index 접근 전 확인
             end_dt = df.index[0] + timedelta(minutes=duration_minutes)
             df = df[df.index <= end_dt]
         
-        print(f"📊 총 {len(df)}개 캔들 분석 시작 (필터링 없음)")
+        print(f"📊 총 {len(df)}개 캔들 분석 시작 (전수 조사)")
         
-        # 2. 데이터 청크 분할 (키 개수만큼 등분)
+        # 2. 데이터 청크 분할
         num_keys = len(self.api_keys)
+        if num_keys == 0:
+            print("❌ API 키가 없습니다.")
+            return {"final_balance": 0, "roi": 0, "win_rate": 0, "trades": [], "logs": ["API 키 없음"]}
+
         chunk_size = len(df) // num_keys + 1
         chunks = [df.iloc[i*chunk_size : (i+1)*chunk_size] for i in range(num_keys)]
         
-        # RPD 경고
-        max_capacity = num_keys * 250
-        if len(df) > max_capacity:
-            print(f"⚠️ 경고: 데이터({len(df)}개)가 일일 API 한도({max_capacity}개)를 초과합니다.")
-            print(f"    초과분은 분석되지 않고 스킵됩니다.")
-        
-        # 3. 병렬 실행 (Strict Mode)
+        # 3. 병렬 실행
         ai_results = {}
         with ThreadPoolExecutor(max_workers=num_keys) as executor:
             futures = []
@@ -148,7 +180,7 @@ class Backtester:
                     res = future.result()
                     ai_results.update(res)
                 except Exception as e:
-                    print(f"Worker Error: {e}")
+                    print(f"Worker Exception: {e}")
 
         # 4. 순차 시뮬레이션
         print("\n🚀 시뮬레이션 정산 시작...")
@@ -160,7 +192,6 @@ class Backtester:
         total_trades = 0
         FEE_RATE = 0.0004
         
-        # 시뮬레이션 루프 (시간순)
         for idx, row in df.iterrows():
             curr_price = row['close']
             
@@ -169,9 +200,6 @@ class Backtester:
                 side = position['side']
                 entry_price = position['entry_price']
                 amount = position['amount']
-                
-                # 손익 계산
-                pnl_pct = (curr_price - entry_price) / entry_price if side == 'long' else (entry_price - curr_price) / entry_price
                 
                 # 조건 확인
                 sl = position.get('sl')
@@ -183,7 +211,7 @@ class Backtester:
                 if side == 'long':
                     if sl and curr_price <= sl: is_closed, reason = True, "SL"
                     elif tp and curr_price >= tp: is_closed, reason = True, "TP"
-                else:
+                else: # short
                     if sl and curr_price >= sl: is_closed, reason = True, "SL"
                     elif tp and curr_price <= tp: is_closed, reason = True, "TP"
                 
@@ -191,7 +219,7 @@ class Backtester:
                     pnl_money = (curr_price - entry_price) * amount if side == 'long' else (entry_price - curr_price) * amount
                     fee = curr_price * amount * FEE_RATE
                     net_pnl = pnl_money - fee
-                    balance += net_pnl + (amount * entry_price) # 원금+손익
+                    balance += net_pnl + (amount * entry_price) 
                     
                     roi_trade = (net_pnl / (amount * entry_price)) * 100
                     trades.append({'time': idx, 'roi': roi_trade, 'pnl': net_pnl, 'reason': reason})
@@ -214,7 +242,6 @@ class Backtester:
                     
                     sl = res.get('sl')
                     tp = res.get('tp')
-                    # 안전장치: AI가 SL 안주면 2%
                     if not sl:
                         sl = curr_price * 0.98 if decision == 'long' else curr_price * 1.02
                     
@@ -237,7 +264,3 @@ class Backtester:
             "trades": trades,
             "logs": logs
         }
-            "trades": trades,
-            "logs": logs
-        }
-
