@@ -95,12 +95,7 @@ class KeyManager:
             else: status = f"🔴 오류 다수 ({count}회)"
             
             err_msg = last_err if last_err == "None" else f"⚠️ {last_err[:40]}..."
-            
-            embed.add_field(
-                name=f"🏷️ {name}", 
-                value=f"**상태:** {status}\n**로그:** {err_msg}", 
-                inline=False
-            )
+            embed.add_field(name=f"🏷️ {name}", value=f"**상태:** {status}\n**로그:** {err_msg}", inline=False)
         return embed
 
 key_manager = KeyManager(GEMINI_KEYS_RAW)
@@ -118,7 +113,7 @@ is_live_active = False
 dashboard_msg = None 
 key_dashboard_msg = None 
 
-# [핵심] 바이낸스 선물 API (USDT)
+# [핵심] 바이낸스 선물 API 사용
 binance = ccxt.binanceusdm({
     'options': {'defaultType': 'future'},
     'enableRateLimit': True
@@ -128,6 +123,7 @@ binance = ccxt.binanceusdm({
 # 2. 헬퍼 함수
 # ==========================================
 def usdt_to_krw(usdt):
+    """USDT -> KRW 변환 (단순 표시용)"""
     return int(usdt * USD_KRW_RATE)
 
 async def send_split_field_embed(channel, base_embed, field_name, long_text):
@@ -140,11 +136,7 @@ async def send_split_field_embed(channel, base_embed, field_name, long_text):
     await channel.send(embed=base_embed)
     
     for i, chunk in enumerate(chunks[1:], start=2):
-        follow_up = discord.Embed(
-            title=f"📄 {field_name} (이어짐 {i}/{len(chunks)})", 
-            description=chunk, 
-            color=base_embed.color
-        )
+        follow_up = discord.Embed(title=f"📄 {field_name} ({i}/{len(chunks)})", description=chunk, color=base_embed.color)
         await channel.send(embed=follow_up)
 
 async def send_split_description_embed(channel, title, long_text, color):
@@ -165,11 +157,10 @@ async def ask_ai_decision(df):
     try:
         if df.empty: return {"decision": "hold", "confidence": 0}
         
-        # [수정] 최근 5개 캔들 흐름 요약
         recent_trend = df.tail(5)[['close', 'volume', 'RSI', 'MACD']].to_string()
         row = df.iloc[-1]
         
-        # [수정] 전문가용 프롬프트 데이터
+        # [전문가용 프롬프트 데이터]
         data_str = f"""
         [Current Market Data (5m Candle)]
         - Timestamp: {row.name}
@@ -191,7 +182,7 @@ async def ask_ai_decision(df):
         {recent_trend}
         """
         
-        # [수정] 월스트리트 트레이더 페르소나
+        # [월스트리트 트레이더 페르소나]
         prompt = f"""
         Act as a World-Class Bitcoin Futures Trader (Scalper).
         Your goal is to maximize profit while strictly managing risk.
@@ -229,28 +220,24 @@ async def ask_ai_decision(df):
         return {"decision": "hold", "confidence": 0}
 
 async def translate_reason(text):
-    # (그대로 유지)
     used_key = key_manager.get_key()
     if not used_key: return text
     try:
         genai.configure(api_key=used_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') # [유지] 2.5 Flash
+        model = genai.GenerativeModel('gemini-2.5-flash')
         prompt = f"Translate this trading reasoning into natural Korean:\n'{text}'"
         response = await asyncio.to_thread(model.generate_content, prompt)
         return response.text.strip()
     except: return text
 
 async def analyze_failure(trade_info, df_context):
-    """
-    [유지] 실패 분석 (팩트 폭격)
-    """
     used_key = None
     try:
         used_key = key_manager.get_key()
         if not used_key: return "API 키 없음"
         
         genai.configure(api_key=used_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') # [유지] 2.5 Flash
+        model = genai.GenerativeModel('gemini-2.5-flash')
         prompt = f"""
         Act as a Wall Street Senior Trader.
         My bot just lost money. Analyze why.
@@ -307,8 +294,9 @@ async def update_dashboard():
             status_text = f"🔥 {side} 포지션 (Binance)"
             color = 0x2ecc71 if total_roi >= 0 else 0xe74c3c
             
+            # [USDT / KRW 병기]
             pnl_krw = usdt_to_krw(unrealized_usdt)
-            pnl_rate_curr = (unrealized_usdt / pos['invested_krw']) * 100 # invested_krw=USDT값
+            pnl_rate_curr = (unrealized_usdt / pos['invested_krw']) * 100 
             
             pnl_text = f"${unrealized_usdt:.2f} ({pnl_rate_curr:+.2f}%)\n≈ {pnl_krw:,}원"
             entry_text = f"${pos['entry_price']:.2f}"
@@ -372,7 +360,6 @@ async def live_trading_loop():
     try:
         await update_dashboard()
         
-        # 1. 데이터 조회 (Binance) -> limit=200 필수 (EMA 200 계산용)
         try:
             ohlcv = await asyncio.to_thread(binance.fetch_ohlcv, "BTC/USDT", "5m", limit=200)
             if not ohlcv: return
@@ -387,7 +374,6 @@ async def live_trading_loop():
             print(f"Data Fetch Error: {e}")
             return
 
-        # 2. 포지션 청산
         if live_wallet.position:
             pos = live_wallet.position
             sl_price = pos['sl']
@@ -413,12 +399,10 @@ async def live_trading_loop():
                     embed.add_field(name="수익률", value=f"{trade_result['profit_rate']:.2f}%", inline=True)
                     await ch.send(embed=embed)
                     
-                    # [유지] 실패 분석 (손실 발생 시)
                     if trade_result['pnl'] < 0:
                         feedback = await analyze_failure(trade_result, df_binance)
                         await send_split_description_embed(ch, "😭 전문 트레이더의 팩트 폭격", feedback, 0x000000)
 
-        # 3. 신규 진입
         if live_wallet.position is None:
             if 10 <= datetime.now().second <= 20: 
                 decision = await ask_ai_decision(df_binance)
@@ -427,13 +411,12 @@ async def live_trading_loop():
                     side = decision['decision']
                     reason_kr = await translate_reason(decision.get('reason', 'No reason'))
                     
-                    # [요청반영] 풀매수 (수수료 제외 99%)
+                    # [요청반영] 잔고의 99% (수수료 제외 풀배팅)
                     balance = live_wallet.get_balance()
                     invest_amount = balance * 0.99 
                     
                     sl = decision.get('sl')
                     tp = decision.get('tp')
-                    # AI가 SL/TP 안주면 기본값 (안전망)
                     if not sl or sl == 0:
                         sl = current_price * 0.98 if side == 'long' else current_price * 1.02
                     if not tp or tp == 0:
@@ -463,7 +446,7 @@ async def start_live_trading(ctx):
         await ctx.send("⚠️ 이미 실행 중입니다.")
         return
     
-    # [변경] 초기 자금 1000 USDT
+    # [변경] 1000 USDT 시작
     live_wallet = FuturesWallet(initial_balance=1000)
     is_live_active = True
     dashboard_msg = None 
@@ -514,15 +497,27 @@ async def start_backtest(ctx, arg1: str, arg2: str = None):
 
     if result:
         embed = discord.Embed(title="📊 백테스트 결과", color=0x9b59b6)
-        embed.add_field(name="최종 자산", value=f"{int(result['final_balance']):,}원", inline=True)
+        embed.add_field(name="최종 자산", value=f"${int(result['final_balance']):,} (USDT)", inline=True)
         embed.add_field(name="수익률", value=f"{result['roi']:.2f}%", inline=True)
         embed.add_field(name="승률", value=f"{result['win_rate']:.1f}%", inline=True)
+        
         logs = result.get('logs', [])
         if logs:
-            log_txt = "\n".join(logs[-5:])
-            if len(log_txt) > 1000: log_txt = log_txt[:1000] + "..."
-            embed.add_field(name="최근 로그", value=f"```\n{log_txt}\n```", inline=False)
-        await ctx.send(embed=embed)
+            # [수정] 전체 로그 출력 시도 + 파일 첨부 기능
+            all_logs_txt = "\n".join(logs)
+            if len(all_logs_txt) > 1000:
+                # 파일로 저장하여 보내기
+                with open("backtest_logs.txt", "w", encoding="utf-8") as f:
+                    f.write(all_logs_txt)
+                file = discord.File("backtest_logs.txt")
+                embed.add_field(name="전체 로그", value="📄 내용이 많아 파일로 첨부합니다.", inline=False)
+                await ctx.send(embed=embed, file=file)
+                os.remove("backtest_logs.txt") # 전송 후 삭제
+            else:
+                embed.add_field(name="전체 로그", value=f"```\n{all_logs_txt}\n```", inline=False)
+                await ctx.send(embed=embed)
+        else:
+            await ctx.send(embed=embed)
     else:
         await ctx.send("❌ 백테스트 실패 (결과 없음)")
 
