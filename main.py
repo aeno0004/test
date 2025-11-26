@@ -42,19 +42,23 @@ TOKEN = config['DISCORD_TOKEN']
 DASHBOARD_ID = int(config.get('DISCORD_DASHBOARD_ID', 0))
 EXPLAIN_ID = int(config.get('DISCORD_EXPLAIN_ID', 0))
 KEY_MANAGER_ID = int(config.get('DISCORD_KEY_MANAGER_ID', 0)) 
-GEMINI_KEYS_RAW = config.get('GEMINI_API_KEYS', [])
+
+# [변경] 원본 키 리스트 로드
+ALL_KEYS_RAW = config.get('GEMINI_API_KEYS', [])
 
 # 환율 (단순 표시용)
 USD_KRW_RATE = 1450 
 
 class KeyManager:
-    def __init__(self, keys_raw):
+    def __init__(self, keys_raw, label="Default"):
         self.keys = []
         self.key_names = {}
         self.error_counts = {} 
         self.last_errors = {} 
         self.idx = 0
+        self.label = label 
         
+        # [변경] 이미 분류된 "키:이름" 형태의 리스트를 받아서 처리
         for item in keys_raw:
             if ':' in item:
                 k, name = item.split(':', 1)
@@ -80,10 +84,8 @@ class KeyManager:
             self.error_counts[key] += 1
             self.last_errors[key] = str(error)
             
-    def get_status_embed(self):
-        embed = discord.Embed(title="🔑 API Key 상태 모니터링", color=0x9b59b6)
-        embed.description = f"총 {len(self.keys)}개의 키가 로드되었습니다."
-        embed.set_footer(text=f"Last Update: {datetime.now().strftime('%H:%M:%S')} | 10초 주기 갱신")
+    def add_status_to_embed(self, embed):
+        embed.add_field(name=f"📂 {self.label} Keys", value=f"총 {len(self.keys)}개", inline=False)
         
         for k in self.keys:
             name = self.key_names[k]
@@ -94,11 +96,46 @@ class KeyManager:
             elif count < 5: status = f"🟡 불안정 ({count}회)"
             else: status = f"🔴 오류 다수 ({count}회)"
             
-            err_msg = last_err if last_err == "None" else f"⚠️ {last_err[:40]}..."
-            embed.add_field(name=f"🏷️ {name}", value=f"**상태:** {status}\n**로그:** {err_msg}", inline=False)
-        return embed
+            err_msg = last_err if last_err == "None" else f"⚠️ {last_err[:30]}..."
+            
+            embed.add_field(
+                name=f"🏷️ {name}", 
+                value=f"**상태:** {status}\n**로그:** {err_msg}", 
+                inline=False
+            )
 
-key_manager = KeyManager(GEMINI_KEYS_RAW)
+# ==========================================
+# [NEW] 키 분류 로직 (a:실전 / b:백테스트)
+# ==========================================
+live_keys_list = []
+backtest_keys_list = []
+
+print("🔑 API Key 분류 중...")
+for raw_item in ALL_KEYS_RAW:
+    # 포맷 확인: KEY:NAME:TYPE
+    parts = raw_item.split(':')
+    
+    if len(parts) == 3:
+        key = parts[0].strip()
+        name = parts[1].strip()
+        usage = parts[2].strip().lower()
+        
+        formatted_item = f"{key}:{name}" # KeyManager에게 넘겨줄 포맷
+        
+        if usage == 'a':
+            live_keys_list.append(formatted_item)
+            print(f"  -> [실전용] {name} 등록 완료")
+        elif usage == 'b':
+            backtest_keys_list.append(formatted_item)
+            print(f"  -> [백테스트용] {name} 등록 완료")
+        else:
+            print(f"  ⚠️ 알 수 없는 타입({usage}): {name} (무시됨)")
+    else:
+        print(f"  ⚠️ 형식 오류(Key:Name:a/b 아님): {raw_item}")
+
+# 매니저 초기화
+key_manager_live = KeyManager(live_keys_list, label="Live Trading (a)")
+key_manager_backtest = KeyManager(backtest_keys_list, label="Backtesting (b)")
 
 # ==========================================
 # 1. 봇 및 변수 초기화
@@ -107,13 +144,15 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-backtester = Backtester(api_keys=key_manager.keys)
+# [중요] 백테스터에는 'b' 키만 전달
+backtester = Backtester(api_keys=key_manager_backtest.keys)
+
 live_wallet = None 
 is_live_active = False
 dashboard_msg = None 
 key_dashboard_msg = None 
 
-# [핵심] 바이낸스 선물 API 사용
+# 바이낸스 선물 API (USDT)
 binance = ccxt.binanceusdm({
     'options': {'defaultType': 'future'},
     'enableRateLimit': True
@@ -123,7 +162,6 @@ binance = ccxt.binanceusdm({
 # 2. 헬퍼 함수
 # ==========================================
 def usdt_to_krw(usdt):
-    """USDT -> KRW 변환 (단순 표시용)"""
     return int(usdt * USD_KRW_RATE)
 
 async def send_split_field_embed(channel, base_embed, field_name, long_text):
@@ -136,7 +174,11 @@ async def send_split_field_embed(channel, base_embed, field_name, long_text):
     await channel.send(embed=base_embed)
     
     for i, chunk in enumerate(chunks[1:], start=2):
-        follow_up = discord.Embed(title=f"📄 {field_name} ({i}/{len(chunks)})", description=chunk, color=base_embed.color)
+        follow_up = discord.Embed(
+            title=f"📄 {field_name} (이어짐 {i}/{len(chunks)})", 
+            description=chunk, 
+            color=base_embed.color
+        )
         await channel.send(embed=follow_up)
 
 async def send_split_description_embed(channel, title, long_text, color):
@@ -150,7 +192,7 @@ async def send_split_description_embed(channel, title, long_text, color):
         await channel.send(embed=embed)
 
 # ==========================================
-# 3. AI 관련 함수
+# 3. AI 관련 함수 (실전용 'a' 키 사용)
 # ==========================================
 async def ask_ai_decision(df):
     used_key = None
@@ -160,7 +202,6 @@ async def ask_ai_decision(df):
         recent_trend = df.tail(5)[['close', 'volume', 'RSI', 'MACD']].to_string()
         row = df.iloc[-1]
         
-        # [전문가용 프롬프트 데이터]
         data_str = f"""
         [Current Market Data (5m Candle)]
         - Timestamp: {row.name}
@@ -182,7 +223,6 @@ async def ask_ai_decision(df):
         {recent_trend}
         """
         
-        # [월스트리트 트레이더 페르소나]
         prompt = f"""
         Act as a World-Class Bitcoin Futures Trader (Scalper).
         Your goal is to maximize profit while strictly managing risk.
@@ -205,22 +245,23 @@ async def ask_ai_decision(df):
         {{"decision": "long/short/hold", "confidence": 0-100, "sl": price, "tp": price, "reason": "Brief logic in Korean"}}
         """
         
-        used_key = key_manager.get_key()
-        if not used_key: raise Exception("No API Keys available")
+        # [중요] 실전용 매니저 사용
+        used_key = key_manager_live.get_key()
+        if not used_key: raise Exception("No Live (Type 'a') Keys available")
         
         genai.configure(api_key=used_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') # [유지] 2.5 Flash
+        model = genai.GenerativeModel('gemini-2.5-flash') 
         
         response = await asyncio.to_thread(model.generate_content, prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
         print(f"⚠️ AI Error: {e}")
-        if used_key: key_manager.report_error(used_key, e)
+        if used_key: key_manager_live.report_error(used_key, e)
         return {"decision": "hold", "confidence": 0}
 
 async def translate_reason(text):
-    used_key = key_manager.get_key()
+    used_key = key_manager_live.get_key()
     if not used_key: return text
     try:
         genai.configure(api_key=used_key)
@@ -233,7 +274,7 @@ async def translate_reason(text):
 async def analyze_failure(trade_info, df_context):
     used_key = None
     try:
-        used_key = key_manager.get_key()
+        used_key = key_manager_live.get_key()
         if not used_key: return "API 키 없음"
         
         genai.configure(api_key=used_key)
@@ -257,7 +298,7 @@ async def analyze_failure(trade_info, df_context):
         response = await asyncio.to_thread(model.generate_content, prompt)
         return response.text.strip()
     except Exception as e:
-        if used_key: key_manager.report_error(used_key, e)
+        if used_key: key_manager_live.report_error(used_key, e)
         return "분석 실패 (API 오류)"
 
 # ==========================================
@@ -294,7 +335,6 @@ async def update_dashboard():
             status_text = f"🔥 {side} 포지션 (Binance)"
             color = 0x2ecc71 if total_roi >= 0 else 0xe74c3c
             
-            # [USDT / KRW 병기]
             pnl_krw = usdt_to_krw(unrealized_usdt)
             pnl_rate_curr = (unrealized_usdt / pos['invested_krw']) * 100 
             
@@ -347,9 +387,17 @@ async def key_monitoring_loop():
     global key_dashboard_msg
     ch = bot.get_channel(KEY_MANAGER_ID)
     if not ch: return
+    
+    embed = discord.Embed(title="🔑 API Key 통합 모니터링", color=0x9b59b6)
+    embed.set_footer(text=f"Last Update: {datetime.now().strftime('%H:%M:%S')} | 10초 주기 갱신")
+    
+    # 두 매니저의 상태를 하나의 메시지에 표시
+    key_manager_live.add_status_to_embed(embed)
+    key_manager_backtest.add_status_to_embed(embed)
+    
     try:
-        if key_dashboard_msg: await key_dashboard_msg.edit(embed=key_manager.get_status_embed())
-        else: key_dashboard_msg = await ch.send(embed=key_manager.get_status_embed())
+        if key_dashboard_msg: await key_dashboard_msg.edit(embed=embed)
+        else: key_dashboard_msg = await ch.send(embed=embed)
     except: pass
 
 @tasks.loop(seconds=10)
@@ -360,6 +408,7 @@ async def live_trading_loop():
     try:
         await update_dashboard()
         
+        # 1. 데이터 조회 (limit=200)
         try:
             ohlcv = await asyncio.to_thread(binance.fetch_ohlcv, "BTC/USDT", "5m", limit=200)
             if not ohlcv: return
@@ -411,9 +460,8 @@ async def live_trading_loop():
                     side = decision['decision']
                     reason_kr = await translate_reason(decision.get('reason', 'No reason'))
                     
-                    # [요청반영] 잔고의 99% (수수료 제외 풀배팅)
                     balance = live_wallet.get_balance()
-                    invest_amount = balance * 0.99 
+                    invest_amount = balance * 0.99 # 잔고 99%
                     
                     sl = decision.get('sl')
                     tp = decision.get('tp')
@@ -446,7 +494,6 @@ async def start_live_trading(ctx):
         await ctx.send("⚠️ 이미 실행 중입니다.")
         return
     
-    # [변경] 1000 USDT 시작
     live_wallet = FuturesWallet(initial_balance=1000)
     is_live_active = True
     dashboard_msg = None 
@@ -503,16 +550,14 @@ async def start_backtest(ctx, arg1: str, arg2: str = None):
         
         logs = result.get('logs', [])
         if logs:
-            # [수정] 전체 로그 출력 시도 + 파일 첨부 기능
             all_logs_txt = "\n".join(logs)
             if len(all_logs_txt) > 1000:
-                # 파일로 저장하여 보내기
                 with open("backtest_logs.txt", "w", encoding="utf-8") as f:
                     f.write(all_logs_txt)
                 file = discord.File("backtest_logs.txt")
                 embed.add_field(name="전체 로그", value="📄 내용이 많아 파일로 첨부합니다.", inline=False)
                 await ctx.send(embed=embed, file=file)
-                os.remove("backtest_logs.txt") # 전송 후 삭제
+                os.remove("backtest_logs.txt")
             else:
                 embed.add_field(name="전체 로그", value=f"```\n{all_logs_txt}\n```", inline=False)
                 await ctx.send(embed=embed)
