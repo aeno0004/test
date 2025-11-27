@@ -43,10 +43,10 @@ DASHBOARD_ID = int(config.get('DISCORD_DASHBOARD_ID', 0))
 EXPLAIN_ID = int(config.get('DISCORD_EXPLAIN_ID', 0))
 KEY_MANAGER_ID = int(config.get('DISCORD_KEY_MANAGER_ID', 0)) 
 
-# [변경] 원본 키 리스트 로드
+# 키 리스트 로드
 ALL_KEYS_RAW = config.get('GEMINI_API_KEYS', [])
 
-# 환율 (단순 표시용)
+# 환율
 USD_KRW_RATE = 1450 
 
 class KeyManager:
@@ -55,10 +55,10 @@ class KeyManager:
         self.key_names = {}
         self.error_counts = {} 
         self.last_errors = {} 
+        self.suspended_keys = set() # [NEW] 사용 중지된 키 목록
         self.idx = 0
         self.label = label 
         
-        # [변경] 이미 분류된 "키:이름" 형태의 리스트를 받아서 처리
         for item in keys_raw:
             if ':' in item:
                 k, name = item.split(':', 1)
@@ -74,66 +74,85 @@ class KeyManager:
             self.last_errors[k] = "None"
 
     def get_key(self):
+        """살아있는 키를 라운드 로빈으로 반환"""
         if not self.keys: return None
-        k = self.keys[self.idx]
-        self.idx = (self.idx + 1) % len(self.keys)
-        return k
+        
+        start_idx = self.idx
+        # 한 바퀴 돌 때까지 사용 가능한 키 찾기
+        for _ in range(len(self.keys)):
+            k = self.keys[self.idx]
+            self.idx = (self.idx + 1) % len(self.keys)
+            
+            if k not in self.suspended_keys:
+                return k
+        
+        return None # 모든 키가 정지됨
     
     def report_error(self, key, error):
+        """에러 보고 및 429(할당량 초과) 감지 시 키 정지"""
         if key in self.error_counts:
             self.error_counts[key] += 1
-            self.last_errors[key] = str(error)
+            error_str = str(error)
+            self.last_errors[key] = error_str
             
+            # [NEW] 할당량 초과 에러 감지
+            if "429" in error_str or "Quota exceeded" in error_str:
+                if key not in self.suspended_keys:
+                    self.suspended_keys.add(key)
+                    print(f"🚫 API Key 정지됨 ({self.key_names[key]}): 하루 할당량 초과")
+
     def add_status_to_embed(self, embed):
-        embed.add_field(name=f"📂 {self.label} Keys", value=f"총 {len(self.keys)}개", inline=False)
+        """Embed에 상태 필드 추가"""
+        active_count = len(self.keys) - len(self.suspended_keys)
+        embed.add_field(name=f"📂 {self.label} Keys", value=f"활성: {active_count} / 총: {len(self.keys)}", inline=False)
         
         for k in self.keys:
             name = self.key_names[k]
             count = self.error_counts[k]
             last_err = self.last_errors[k]
             
-            if count == 0: status = "🟢 정상"
-            elif count < 5: status = f"🟡 불안정 ({count}회)"
-            else: status = f"🔴 오류 다수 ({count}회)"
+            # 상태 아이콘 결정
+            if k in self.suspended_keys:
+                status = "⛔ 하루 제한 초과 (사용 중지)"
+            elif count == 0: 
+                status = "🟢 정상"
+            elif count < 5: 
+                status = f"🟡 불안정 ({count}회)"
+            else: 
+                status = f"🔴 오류 다수 ({count}회)"
             
             err_msg = last_err if last_err == "None" else f"⚠️ {last_err[:30]}..."
             
             embed.add_field(
-                name=f"🏷️ {name}", 
+                name=f"🏷️ {name} ({self.label})", 
                 value=f"**상태:** {status}\n**로그:** {err_msg}", 
                 inline=False
             )
 
 # ==========================================
-# [NEW] 키 분류 로직 (a:실전 / b:백테스트)
+# 키 분류 및 매니저 초기화
 # ==========================================
 live_keys_list = []
 backtest_keys_list = []
 
 print("🔑 API Key 분류 중...")
 for raw_item in ALL_KEYS_RAW:
-    # 포맷 확인: KEY:NAME:TYPE
     parts = raw_item.split(':')
-    
     if len(parts) == 3:
         key = parts[0].strip()
         name = parts[1].strip()
         usage = parts[2].strip().lower()
-        
-        formatted_item = f"{key}:{name}" # KeyManager에게 넘겨줄 포맷
+        formatted_item = f"{key}:{name}"
         
         if usage == 'a':
             live_keys_list.append(formatted_item)
-            print(f"  -> [실전용] {name} 등록 완료")
+            print(f"  -> [실전용] {name}")
         elif usage == 'b':
             backtest_keys_list.append(formatted_item)
-            print(f"  -> [백테스트용] {name} 등록 완료")
-        else:
-            print(f"  ⚠️ 알 수 없는 타입({usage}): {name} (무시됨)")
+            print(f"  -> [백테스트용] {name}")
     else:
-        print(f"  ⚠️ 형식 오류(Key:Name:a/b 아님): {raw_item}")
+        print(f"  ⚠️ 형식 오류: {raw_item}")
 
-# 매니저 초기화
 key_manager_live = KeyManager(live_keys_list, label="Live Trading (a)")
 key_manager_backtest = KeyManager(backtest_keys_list, label="Backtesting (b)")
 
@@ -144,15 +163,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# [중요] 백테스터에는 'b' 키만 전달
 backtester = Backtester(api_keys=key_manager_backtest.keys)
-
 live_wallet = None 
 is_live_active = False
 dashboard_msg = None 
 key_dashboard_msg = None 
 
-# 바이낸스 선물 API (USDT)
 binance = ccxt.binanceusdm({
     'options': {'defaultType': 'future'},
     'enableRateLimit': True
@@ -174,11 +190,7 @@ async def send_split_field_embed(channel, base_embed, field_name, long_text):
     await channel.send(embed=base_embed)
     
     for i, chunk in enumerate(chunks[1:], start=2):
-        follow_up = discord.Embed(
-            title=f"📄 {field_name} (이어짐 {i}/{len(chunks)})", 
-            description=chunk, 
-            color=base_embed.color
-        )
+        follow_up = discord.Embed(title=f"📄 {field_name} ({i}/{len(chunks)})", description=chunk, color=base_embed.color)
         await channel.send(embed=follow_up)
 
 async def send_split_description_embed(channel, title, long_text, color):
@@ -192,7 +204,7 @@ async def send_split_description_embed(channel, title, long_text, color):
         await channel.send(embed=embed)
 
 # ==========================================
-# 3. AI 관련 함수 (실전용 'a' 키 사용)
+# 3. AI 관련 함수
 # ==========================================
 async def ask_ai_decision(df):
     used_key = None
@@ -214,9 +226,9 @@ async def ask_ai_decision(df):
         - Trend Status: {'Bullish (Up)' if row['EMA50'] > row['EMA200'] else 'Bearish (Down)'}
         
         [Momentum & Volatility]
-        - RSI(14): {row['RSI']:.1f} (Overbought > 70, Oversold < 30)
+        - RSI(14): {row['RSI']:.1f}
         - MACD: {row['MACD']:.2f} (Signal: {row['MACD_Signal']:.2f})
-        - ATR(14): {row['ATR']:.2f} (Use this for SL/TP calculation)
+        - ATR(14): {row['ATR']:.2f}
         - BB Position: {(row['close'] - row['BB_Low']) / (row['BB_Up'] - row['BB_Low']):.2f}
         
         [Recent 5 Candles History]
@@ -245,9 +257,11 @@ async def ask_ai_decision(df):
         {{"decision": "long/short/hold", "confidence": 0-100, "sl": price, "tp": price, "reason": "Brief logic in Korean"}}
         """
         
-        # [중요] 실전용 매니저 사용
+        # [중요] 살아있는 키만 가져옴 (없으면 None)
         used_key = key_manager_live.get_key()
-        if not used_key: raise Exception("No Live (Type 'a') Keys available")
+        if not used_key: 
+            print("❌ [Critical] 모든 실전용 API 키가 한도 초과로 정지되었습니다.")
+            return {"decision": "hold", "confidence": 0}
         
         genai.configure(api_key=used_key)
         model = genai.GenerativeModel('gemini-2.5-flash') 
@@ -256,7 +270,8 @@ async def ask_ai_decision(df):
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
-        print(f"⚠️ AI Error: {e}")
+        print(f"⚠️ AI Error ({key_manager_live.key_names.get(used_key, 'Unknown')}): {e}")
+        # 에러 리포트 시 429면 내부적으로 정지 처리됨
         if used_key: key_manager_live.report_error(used_key, e)
         return {"decision": "hold", "confidence": 0}
 
@@ -275,7 +290,7 @@ async def analyze_failure(trade_info, df_context):
     used_key = None
     try:
         used_key = key_manager_live.get_key()
-        if not used_key: return "API 키 없음"
+        if not used_key: return "API 키 없음 (전부 정지됨)"
         
         genai.configure(api_key=used_key)
         model = genai.GenerativeModel('gemini-2.5-flash')
@@ -302,9 +317,11 @@ async def analyze_failure(trade_info, df_context):
         return "분석 실패 (API 오류)"
 
 # ==========================================
-# 4. 실시간 루프 (Binance 기준)
+# 4. 루프 및 임베드 업데이트 로직
 # ==========================================
-async def update_dashboard():
+
+async def update_trading_embed():
+    """실시간 매매 현황 임베드 업데이트"""
     global dashboard_msg
     ch_dash = bot.get_channel(DASHBOARD_ID)
     if not ch_dash: return
@@ -336,13 +353,12 @@ async def update_dashboard():
             color = 0x2ecc71 if total_roi >= 0 else 0xe74c3c
             
             pnl_krw = usdt_to_krw(unrealized_usdt)
-            pnl_rate_curr = (unrealized_usdt / pos['invested_krw']) * 100 
+            pnl_rate_curr = (unrealized_usdt / pos['invested_krw']) * 100
             
             pnl_text = f"${unrealized_usdt:.2f} ({pnl_rate_curr:+.2f}%)\n≈ {pnl_krw:,}원"
             entry_text = f"${pos['entry_price']:.2f}"
             
-            sl = pos.get('sl')
-            tp = pos.get('tp')
+            sl, tp = pos.get('sl'), pos.get('tp')
             sl_text = f"${sl:.2f}" if sl else "-"
             tp_text = f"${tp:.2f}" if tp else "-"
             sl_tp_text = f"SL: {sl_text} | TP: {tp_text}"
@@ -382,16 +398,15 @@ async def update_dashboard():
             dashboard_msg = await ch_dash.send(embed=embed)
     except: pass
 
-@tasks.loop(seconds=10)
-async def key_monitoring_loop():
+async def update_key_embed():
+    """API 키 관리 임베드 업데이트"""
     global key_dashboard_msg
     ch = bot.get_channel(KEY_MANAGER_ID)
     if not ch: return
     
     embed = discord.Embed(title="🔑 API Key 통합 모니터링", color=0x9b59b6)
-    embed.set_footer(text=f"Last Update: {datetime.now().strftime('%H:%M:%S')} | 10초 주기 갱신")
+    embed.set_footer(text=f"Last Update: {datetime.now().strftime('%H:%M:%S')}")
     
-    # 두 매니저의 상태를 하나의 메시지에 표시
     key_manager_live.add_status_to_embed(embed)
     key_manager_backtest.add_status_to_embed(embed)
     
@@ -401,14 +416,28 @@ async def key_monitoring_loop():
     except: pass
 
 @tasks.loop(seconds=10)
+async def key_monitoring_loop():
+    """매매가 꺼져있을 때만 독립적으로 도는 키 모니터링 루프"""
+    if is_live_active: return # 매매 중일때는 live_trading_loop가 담당함
+    await update_key_embed()
+
+@tasks.loop(seconds=10)
 async def live_trading_loop():
+    """실전 매매 메인 루프"""
     global is_live_active, live_wallet
     if not is_live_active or not live_wallet: return
 
     try:
-        await update_dashboard()
+        # [순서 1] 매매 임베드 업데이트
+        await update_trading_embed()
         
-        # 1. 데이터 조회 (limit=200)
+        # [순서 2] 5초 대기 (요청 반영)
+        await asyncio.sleep(5)
+        
+        # [순서 3] 키 관리 임베드 업데이트
+        await update_key_embed()
+        
+        # --- 매매 로직 시작 ---
         try:
             ohlcv = await asyncio.to_thread(binance.fetch_ohlcv, "BTC/USDT", "5m", limit=200)
             if not ohlcv: return
@@ -425,8 +454,7 @@ async def live_trading_loop():
 
         if live_wallet.position:
             pos = live_wallet.position
-            sl_price = pos['sl']
-            tp_price = pos['tp']
+            sl_price, tp_price = pos['sl'], pos['tp']
             close_reason = None
             
             if pos['type'] == 'long':
@@ -442,7 +470,6 @@ async def live_trading_loop():
                 if ch:
                     pnl_krw = usdt_to_krw(trade_result['pnl'])
                     color = 0x00ff00 if trade_result['pnl'] > 0 else 0xff0000
-                    
                     embed = discord.Embed(title=f"⚡ 포지션 종료: {close_reason}", color=color)
                     embed.add_field(name="수익금", value=f"${trade_result['pnl']:.2f} (≈{pnl_krw:,}원)", inline=True)
                     embed.add_field(name="수익률", value=f"{trade_result['profit_rate']:.2f}%", inline=True)
@@ -461,7 +488,7 @@ async def live_trading_loop():
                     reason_kr = await translate_reason(decision.get('reason', 'No reason'))
                     
                     balance = live_wallet.get_balance()
-                    invest_amount = balance * 0.99 # 잔고 99%
+                    invest_amount = balance * 0.99 
                     
                     sl = decision.get('sl')
                     tp = decision.get('tp')
@@ -479,8 +506,8 @@ async def live_trading_loop():
                         embed.add_field(name="진입가", value=f"${current_price:,.2f}", inline=True)
                         await send_split_field_embed(ch, embed, "판단 이유", reason_kr)
                     
-                    await update_dashboard()
-                    await asyncio.sleep(10)
+                    await update_trading_embed() # 진입 직후 갱신
+                    await asyncio.sleep(5) 
 
     except Exception as e:
         print(f"🔥 Live Loop Error: {e}")
@@ -494,13 +521,15 @@ async def start_live_trading(ctx):
         await ctx.send("⚠️ 이미 실행 중입니다.")
         return
     
+    # 매매 시작 시 키 모니터링 루프 중단 (live_trading_loop에서 통합 관리)
+    if key_monitoring_loop.is_running():
+        key_monitoring_loop.stop()
+
     live_wallet = FuturesWallet(initial_balance=1000)
     is_live_active = True
     dashboard_msg = None 
     
     await ctx.send("🚀 **Binance 실전 모의투자** 시작! (초기자금: 1,000 USDT)")
-    try: await update_dashboard()
-    except: pass
     live_trading_loop.start()
 
 @bot.command(name="테스트매매종료")
@@ -508,22 +537,21 @@ async def stop_live_trading(ctx):
     global is_live_active
     is_live_active = False
     live_trading_loop.stop()
-    await ctx.send("⏸️ 매매를 중지했습니다.")
+    
+    # 매매 종료 시 키 모니터링 루프 재가동
+    if not key_monitoring_loop.is_running():
+        key_monitoring_loop.start()
+        
+    await ctx.send("⏸️ 매매를 중지했습니다. (키 모니터링은 유지됩니다)")
 
 @bot.command(name="종료")
 async def shutdown(ctx):
-    global dashboard_msg, key_dashboard_msg
-    if dashboard_msg:
-        try: await dashboard_msg.delete()
-        except: pass
-    if key_dashboard_msg:
-        try: await key_dashboard_msg.delete()
-        except: pass
     await ctx.send("🤖 봇을 종료합니다.")
     await bot.close()
 
 @bot.command(name="백테스트")
 async def start_backtest(ctx, arg1: str, arg2: str = None):
+    # (백테스트 코드는 기존과 동일 유지)
     try:
         days = float(arg1)
         await ctx.send(f"⏳ 최근 {days}일 백테스트 시작...")
@@ -575,7 +603,12 @@ async def on_ready():
         print("✅ 바이낸스 로딩 완료")
     except Exception as e:
         print(f"❌ 바이낸스 로딩 실패: {e}")
-    await update_dashboard()
-    key_monitoring_loop.start()
+        
+    await update_trading_embed()
+    await update_key_embed()
+    
+    # 봇 켜지면 기본적으로 키 모니터링은 시작
+    if not key_monitoring_loop.is_running():
+        key_monitoring_loop.start()
 
 bot.run(TOKEN)
